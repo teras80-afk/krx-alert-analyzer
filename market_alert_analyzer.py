@@ -1,18 +1,18 @@
 """
-투경예고 / 단기과열예고 임계값 조회기
-────────────────────────────────────────
-종목을 입력하면 예고 발동 임계값을 표로 보여줍니다.
- - 각 조건의 기준값, 배수, 임계값(발동가), 현재가를 한눈에 비교
- - 한 조건이라도 미충족이면 예고 미해당
+투경예고 / 단기과열예고 임계값 조회기 + 관심종목 대시보드
+────────────────────────────────────────────────────────
+탭 구성:
+ [1] 개별 종목 조회  — 한 종목을 자세히 들여다봄
+ [2] 관심종목 대시보드 — 등록한 여러 종목을 한번에 체크, 예고 해당은 맨 위로 정렬
 """
 import streamlit as st
 import pandas as pd
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
+from pathlib import Path
 
-st.set_page_config(page_title="예고 임계값 조회기", layout="centered")
-st.title("🔍 투경예고 / 단기과열예고 임계값 조회")
-st.caption("종목을 입력하면 예고 발동 기준가(임계값)와 현재가를 비교해 보여줍니다.")
+st.set_page_config(page_title="예고 임계값 조회기", layout="wide")
+st.title("🔍 투경예고 / 단기과열예고 조회")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -44,166 +44,248 @@ def load_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
     return df[~df.index.duplicated(keep="last")].sort_index()
 
 
+@st.cache_data(ttl=60)
+def load_watchlist() -> list:
+    """watchlist.txt 파일에서 관심종목 불러오기 (없으면 빈 리스트)"""
+    path = Path("watchlist.txt")
+    if not path.exists():
+        return []
+    lines = path.read_text(encoding="utf-8").splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+
+
 # ─────────────────────────────────────────────────────────────
 # 임계값 계산
 # ─────────────────────────────────────────────────────────────
-def build_warning_table(df: pd.DataFrame, idx: int, curr: int) -> pd.DataFrame | None:
-    """투자경고 3대 요건 표 생성"""
-    if idx < 20:
-        return None
+def evaluate_stock(df: pd.DataFrame, idx: int) -> dict:
+    """한 종목의 예고 상태를 종합 판정."""
+    curr = int(df["종가"].iloc[idx])
+    result = {"현재가": curr, "투경예고": None, "단기과열예고": None,
+              "투경_상세": None, "단기_상세": None}
 
-    p5 = int(df["종가"].iloc[idx - 5])
-    p20 = int(df["종가"].iloc[idx - 20])
-    max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
+    # 투자경고
+    if idx >= 20:
+        p5 = int(df["종가"].iloc[idx - 5])
+        p20 = int(df["종가"].iloc[idx - 20])
+        max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
+        th1, th2, th3 = int(p5 * 1.6), int(p20 * 2.0), max15
+        c1, c2, c3 = curr >= th1, curr >= th2, curr >= th3
+        result["투경예고"] = all([c1, c2, c3])
+        result["투경_상세"] = {
+            "① 5일×1.6": (th1, c1),
+            "② 20일×2.0": (th2, c2),
+            "③ 15일최고": (th3, c3),
+        }
 
-    rows = [
-        {"조건": "① 5일 전 대비 60% 상승",
-         "기준값": f"{p5:,}원 (5일 전 종가)",
-         "배수": "× 1.60",
-         "임계값(발동가)": p5 * 1.6,
-         "현재가": curr,
-         "충족": curr >= p5 * 1.6},
-        {"조건": "② 20일 전 대비 100% 상승",
-         "기준값": f"{p20:,}원 (20일 전 종가)",
-         "배수": "× 2.00",
-         "임계값(발동가)": p20 * 2.0,
-         "현재가": curr,
-         "충족": curr >= p20 * 2.0},
-        {"조건": "③ 15거래일 중 최고가",
-         "기준값": f"{max15:,}원 (15일 최고가)",
-         "배수": "× 1.00",
-         "임계값(발동가)": max15,
-         "현재가": curr,
-         "충족": curr >= max15},
-    ]
+    # 단기과열
+    if idx >= 39:
+        avg40 = df["종가"].iloc[idx - 39: idx + 1].mean()
+        th = int(avg40 * 1.3)
+        result["단기과열예고"] = curr >= th
+        result["단기_상세"] = {"40일평균×1.3": (th, curr >= th)}
+
+    return result
+
+
+def format_warning_table(ev: dict, curr: int) -> pd.DataFrame:
+    rows = []
+    for label, (th, ok) in ev["투경_상세"].items():
+        rows.append({
+            "조건": label,
+            "임계값(발동가)": f"{th:,}원",
+            "현재가": f"{curr:,}원",
+            "충족": "✅" if ok else "❌",
+        })
     return pd.DataFrame(rows)
 
 
-def build_overheat_table(df: pd.DataFrame, idx: int, curr: int) -> pd.DataFrame | None:
-    """단기과열 주가요건 표 생성"""
-    if idx < 39:
-        return None
-
-    avg40 = df["종가"].iloc[idx - 39: idx + 1].mean()
-
-    rows = [
-        {"조건": "주가요건 (40일 평균 대비 130%)",
-         "기준값": f"{int(avg40):,}원 (40일 평균 종가)",
-         "배수": "× 1.30",
-         "임계값(발동가)": avg40 * 1.3,
-         "현재가": curr,
-         "충족": curr >= avg40 * 1.3},
-    ]
+def format_overheat_table(ev: dict, curr: int) -> pd.DataFrame:
+    rows = []
+    for label, (th, ok) in ev["단기_상세"].items():
+        rows.append({
+            "조건": label,
+            "임계값(발동가)": f"{th:,}원",
+            "현재가": f"{curr:,}원",
+            "충족": "✅" if ok else "❌",
+        })
     return pd.DataFrame(rows)
 
 
-def format_table(df: pd.DataFrame) -> pd.DataFrame:
-    """표 숫자 포맷팅"""
-    d = df.copy()
-    d["임계값(발동가)"] = d["임계값(발동가)"].apply(lambda v: f"{int(v):,}원")
-    d["현재가"] = d["현재가"].apply(lambda v: f"{int(v):,}원")
-    d["충족"] = d["충족"].apply(lambda v: "✅" if v else "❌")
-    return d
-
-
 # ─────────────────────────────────────────────────────────────
-# UI
+# 공통: 종목명 매핑 로드
 # ─────────────────────────────────────────────────────────────
-user_input = st.text_input("📝 종목코드 6자리 또는 종목명",
-                           value="009150",
-                           placeholder="예: 삼성전자 또는 005930")
-
-if not user_input:
-    st.stop()
-
 try:
     name_map = get_ticker_name_map()
 except Exception as e:
     st.error(f"종목 리스트 로딩 실패: {e}")
     st.stop()
 
-ticker = resolve_ticker(user_input, name_map)
-if not ticker:
-    st.error("종목을 찾지 못했습니다. 6자리 코드나 정확한 종목명을 입력하세요.")
-    st.stop()
-
-name = name_map[ticker]
-end = datetime.now().strftime("%Y-%m-%d")
-start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
-
-try:
-    df = load_ohlcv(ticker, start, end)
-except Exception as e:
-    st.error(f"주가 데이터 로딩 실패: {e}")
-    st.stop()
-
-if df.empty:
-    st.error("주가 데이터가 비어 있습니다.")
-    st.stop()
-
-date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
-selected_date = st.selectbox("📅 기준일", date_list, index=0,
-                              help="기본값은 가장 최근 거래일입니다.")
-
-base_idx = df.index.get_loc(pd.Timestamp(selected_date))
-if isinstance(base_idx, slice):
-    base_idx = base_idx.stop - 1
-
-curr_p = int(df["종가"].iloc[base_idx])
 
 # ═══════════════════════════════════════════════════════════
-# 헤더
+# 탭 구성
 # ═══════════════════════════════════════════════════════════
-st.markdown(f"### 📍 {name} ({ticker})")
-st.markdown(f"**{selected_date} 종가:** <span style='font-size:24px;color:#d35400'>"
-            f"{curr_p:,}원</span>", unsafe_allow_html=True)
+tab1, tab2 = st.tabs(["🎯 개별 종목 조회", "📋 관심종목 대시보드"])
+
+# ───────────────────────────────────────────────────────────
+# 탭 1: 개별 종목 조회
+# ───────────────────────────────────────────────────────────
+with tab1:
+    col_input, col_date_space = st.columns([2, 1])
+    with col_input:
+        user_input = st.text_input("종목코드 6자리 또는 종목명",
+                                   value="009150", key="single_input")
+
+    if user_input:
+        ticker = resolve_ticker(user_input, name_map)
+        if not ticker:
+            st.error("종목을 찾지 못했습니다.")
+        else:
+            name = name_map[ticker]
+            end = datetime.now().strftime("%Y-%m-%d")
+            start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+
+            try:
+                df = load_ohlcv(ticker, start, end)
+            except Exception as e:
+                st.error(f"주가 데이터 로딩 실패: {e}")
+                st.stop()
+
+            if df.empty:
+                st.error("주가 데이터가 비어 있습니다.")
+            else:
+                with col_date_space:
+                    date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
+                    selected_date = st.selectbox("기준일", date_list, index=0,
+                                                  key="single_date")
+
+                base_idx = df.index.get_loc(pd.Timestamp(selected_date))
+                if isinstance(base_idx, slice):
+                    base_idx = base_idx.stop - 1
+
+                ev = evaluate_stock(df, base_idx)
+                curr_p = ev["현재가"]
+
+                st.markdown(f"### 📍 {name} ({ticker})")
+                st.markdown(f"**{selected_date} 종가:** "
+                            f"<span style='font-size:22px;color:#d35400'>"
+                            f"{curr_p:,}원</span>", unsafe_allow_html=True)
+                st.markdown("---")
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("#### ⚠️ 투자경고 예고")
+                    if ev["투경예고"] is None:
+                        st.info("데이터 부족")
+                    elif ev["투경예고"]:
+                        st.error("🔴 예고 해당 — 3대 요건 모두 충족")
+                    else:
+                        n_ok = sum(1 for _, v in ev["투경_상세"].values() if v)
+                        st.success(f"🟢 미해당 — 충족 {n_ok}/3")
+                    if ev["투경_상세"]:
+                        st.dataframe(format_warning_table(ev, curr_p),
+                                     use_container_width=True, hide_index=True)
+
+                with c2:
+                    st.markdown("#### 🔥 단기과열 예고")
+                    if ev["단기과열예고"] is None:
+                        st.info("데이터 부족")
+                    elif ev["단기과열예고"]:
+                        st.error("🔴 주가요건 충족")
+                    else:
+                        st.success("🟢 미해당")
+                    if ev["단기_상세"]:
+                        st.dataframe(format_overheat_table(ev, curr_p),
+                                     use_container_width=True, hide_index=True)
+                    st.caption("※ 단기과열은 회전율·변동성 요건 별도 확인 필요")
+
+
+# ───────────────────────────────────────────────────────────
+# 탭 2: 관심종목 대시보드
+# ───────────────────────────────────────────────────────────
+with tab2:
+    st.caption("관심종목 리스트는 저장소의 `watchlist.txt` 파일에서 관리합니다. "
+               "아래 편집창에서 임시로 추가/변경해도 되지만, 영구 저장하려면 GitHub에서 파일을 수정하세요.")
+
+    default_watchlist = load_watchlist()
+    watch_text = st.text_area(
+        "관심종목 (한 줄에 하나씩, 종목명 또는 6자리 코드)",
+        value="\n".join(default_watchlist) if default_watchlist
+              else "삼성전자\n009150\nSK하이닉스",
+        height=150,
+        help="예: 삼성전자 / 005930 / 퍼스텍 (혼용 가능)",
+    )
+
+    if st.button("🔄 전체 조회", type="primary"):
+        lines = [ln.strip() for ln in watch_text.splitlines()
+                 if ln.strip() and not ln.startswith("#")]
+        if not lines:
+            st.warning("관심종목을 입력하세요.")
+            st.stop()
+
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+
+        summary_rows = []
+        progress = st.progress(0, text="조회 중...")
+
+        for i, line in enumerate(lines):
+            progress.progress((i + 1) / len(lines), text=f"조회 중... {line}")
+            ticker = resolve_ticker(line, name_map)
+            if not ticker:
+                summary_rows.append({
+                    "종목": line, "코드": "—", "종가": "—",
+                    "투경예고": "❓ 종목 못찾음", "단기과열예고": "❓",
+                    "_정렬": 99,
+                })
+                continue
+
+            name = name_map[ticker]
+            try:
+                df = load_ohlcv(ticker, start, end)
+                if df.empty:
+                    raise ValueError("empty")
+                ev = evaluate_stock(df, len(df) - 1)
+            except Exception as e:
+                summary_rows.append({
+                    "종목": name, "코드": ticker, "종가": "—",
+                    "투경예고": f"❓ 조회실패", "단기과열예고": "❓",
+                    "_정렬": 99,
+                })
+                continue
+
+            # 예고 해당 종목을 맨 위로 정렬
+            rank = 0 if (ev["투경예고"] or ev["단기과열예고"]) else 1
+
+            def mark(v):
+                if v is None:
+                    return "—"
+                return "🔴 해당" if v else "🟢 미해당"
+
+            summary_rows.append({
+                "종목": name,
+                "코드": ticker,
+                "종가": f"{ev['현재가']:,}원",
+                "투경예고": mark(ev["투경예고"]),
+                "단기과열예고": mark(ev["단기과열예고"]),
+                "_정렬": rank,
+            })
+
+        progress.empty()
+
+        df_sum = pd.DataFrame(summary_rows).sort_values("_정렬").drop(columns=["_정렬"])
+
+        # 헤드라인 요약
+        alert_count = df_sum["투경예고"].str.contains("🔴").sum() \
+                    + df_sum["단기과열예고"].str.contains("🔴").sum()
+        if alert_count > 0:
+            st.error(f"🚨 예고 해당 건수: **{alert_count}건** (위쪽에 정렬됨)")
+        else:
+            st.success("✅ 관심종목 중 예고 해당 없음")
+
+        st.dataframe(df_sum, use_container_width=True, hide_index=True)
+
+        st.caption(f"기준일: {end} | 조회 종목 수: {len(lines)}개")
 
 st.markdown("---")
-
-# ═══════════════════════════════════════════════════════════
-# 투자경고 예고
-# ═══════════════════════════════════════════════════════════
-st.markdown("### ⚠️ 투자경고 예고")
-
-warn_df = build_warning_table(df, base_idx, curr_p)
-if warn_df is None:
-    st.info("데이터 부족(20거래일 미만)")
-else:
-    all_pass = warn_df["충족"].all()
-    if all_pass:
-        st.error("🔴 **예고 해당** — 3대 요건 모두 충족")
-    else:
-        n_pass = int(warn_df["충족"].sum())
-        st.success(f"🟢 **미해당** — 충족 요건: {n_pass} / 3")
-
-    st.dataframe(format_table(warn_df), use_container_width=True,
-                 hide_index=True)
-    st.caption("※ 3개 요건 **모두** 충족 시 예고 해당. "
-               "특수 지정예고(초단기·중기 등)는 별도 KRX 공시 확인 필요.")
-
-st.markdown("---")
-
-# ═══════════════════════════════════════════════════════════
-# 단기과열 예고
-# ═══════════════════════════════════════════════════════════
-st.markdown("### 🔥 단기과열 예고 (주가요건)")
-
-oh_df = build_overheat_table(df, base_idx, curr_p)
-if oh_df is None:
-    st.info("데이터 부족(40거래일 미만)")
-else:
-    if bool(oh_df["충족"].iloc[0]):
-        st.error("🔴 **주가요건 충족** — 회전율·변동성 별도 확인 필요")
-    else:
-        threshold = int(oh_df["임계값(발동가)"].iloc[0])
-        gap = threshold - curr_p
-        st.success(f"🟢 **미해당** — 임계값까지 {gap:,}원 남음")
-
-    st.dataframe(format_table(oh_df), use_container_width=True,
-                 hide_index=True)
-    st.caption("※ 단기과열은 주가 요건 외에 거래회전율·변동성 요건이 "
-               "모두 충족되어야 실제 예고 지정. 본 표는 **주가 요건만** 판정합니다.")
-
-st.markdown("---")
-st.caption("📌 본 도구는 공개 주가 데이터로 요건을 자체 계산한 참고용입니다. "
+st.caption("📌 공개 주가 데이터 기반 자체 계산 결과입니다. "
            "최종 지정 여부는 한국거래소 공식 공시를 확인하세요.")
