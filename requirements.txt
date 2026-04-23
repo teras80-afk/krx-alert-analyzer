@@ -3,3 +3,4 @@ finance-datareader
 pandas
 requests
 lxml
+OpenDartReader>=0.2.1
