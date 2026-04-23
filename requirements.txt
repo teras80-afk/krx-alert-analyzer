@@ -1,4 +1,5 @@
 streamlit
-   pykrx
-   pandas
-   requests
+finance-datareader
+pandas
+requests
+lxml

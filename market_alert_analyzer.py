@@ -1,12 +1,13 @@
 """
-시장경보(예고/지정) 실시간 리스트 & 요건 분석기
-────────────────────────────────────────────────
-실행: streamlit run market_alert_analyzer.py
+시장경보(예고/지정) 실시간 리스트 & 요건 분석기 (FDR 버전)
+────────────────────────────────────────────────────────
+실행 (로컬):    streamlit run market_alert_analyzer.py
+배포 (Cloud):  GitHub 저장소에 올리면 자동 배포
 """
 import streamlit as st
-from pykrx import stock
 import pandas as pd
 import requests
+import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 
 st.set_page_config(page_title="시장경보 통합 분석기", layout="wide")
@@ -17,49 +18,34 @@ st.title("🚨 시장경보(예고/지정) 실시간 리스트 & 요건 분석")
 # 공용 유틸
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def get_nearest_business_day(base: datetime = None) -> str:
-    """장 마감(15:30) 이전이거나 휴일이면 직전 영업일로 보정."""
-    base = base or datetime.now()
-    # 장중(15:30 이전)이면 전일 데이터가 안정적
-    if base.hour < 15 or (base.hour == 15 and base.minute < 30):
-        base = base - timedelta(days=1)
-    # pykrx가 인식하는 가장 가까운 영업일 탐색
-    for i in range(10):
-        d = (base - timedelta(days=i)).strftime("%Y%m%d")
-        try:
-            if not stock.get_market_ohlcv(d, "005930").empty:
-                return d
-        except Exception:
-            continue
-    return base.strftime("%Y%m%d")
-
-
-@st.cache_data(ttl=3600)
 def get_ticker_name_map() -> dict:
-    """전체 티커-종목명 매핑을 한 번에 생성 (캐시 1시간)."""
-    mapping = {}
-    for mkt in ("KOSPI", "KOSDAQ"):
-        for t in stock.get_market_ticker_list(market=mkt):
-            mapping[t] = stock.get_market_ticker_name(t)
-    return mapping
+    """KRX 상장종목 전체 — 티커→종목명 매핑. FDR 한 번 호출로 끝."""
+    df = fdr.StockListing("KRX")
+    code_col = "Code" if "Code" in df.columns else "Symbol"
+    return dict(zip(df[code_col].astype(str).str.zfill(6), df["Name"]))
 
 
 def resolve_ticker(user_input: str, name_map: dict) -> str | None:
-    """종목코드 6자리 또는 종목명을 받아 티커 반환."""
     s = user_input.strip()
     if s.isdigit() and len(s) == 6:
         return s if s in name_map else None
-    # 정확히 일치하는 종목명 우선
     for t, n in name_map.items():
         if n == s:
             return t
-    # 포함 검색 (종목명 일부 입력 허용)
     hits = [t for t, n in name_map.items() if s in n]
     return hits[0] if len(hits) == 1 else None
 
 
+@st.cache_data(ttl=600)
+def load_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
+    df = fdr.DataReader(ticker, start, end)
+    df = df.rename(columns={"Open": "시가", "High": "고가", "Low": "저가",
+                            "Close": "종가", "Volume": "거래량"})
+    return df[~df.index.duplicated(keep="last")].sort_index()
+
+
 # ─────────────────────────────────────────────────────────────
-# 시장경보 현황 — KRX 내부 엔드포인트 직접 호출
+# KRX 시장경보 리스트 (best-effort)
 # ─────────────────────────────────────────────────────────────
 KRX_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
 KRX_HEADERS = {
@@ -67,67 +53,81 @@ KRX_HEADERS = {
     "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/",
 }
 
-
-@st.cache_data(ttl=600)
-def fetch_krx_bld(bld: str, trd_dd: str, extra: dict = None) -> pd.DataFrame:
-    """KRX bld 엔드포인트 호출 → DataFrame."""
-    data = {"bld": bld, "trdDd": trd_dd, "share": "1", "money": "1",
-            "csvxls_isNo": "false"}
-    if extra:
-        data.update(extra)
-    r = requests.post(KRX_URL, headers=KRX_HEADERS, data=data, timeout=10)
-    r.raise_for_status()
-    js = r.json()
-    # 응답 블록명은 엔드포인트별로 다름 (block1, output 등)
-    for key in ("OutBlock_1", "output", "block1"):
-        if key in js and js[key]:
-            return pd.DataFrame(js[key])
-    return pd.DataFrame()
+BLD_CANDIDATES_SHORT_OVERHEAT = [
+    "dbms/MDC/STAT/standard/MDCSTAT14001",
+    "dbms/MDC/STAT/standard/MDCSTAT13401",
+    "dbms/MDC/STAT/standard/MDCSTAT08401",
+]
+BLD_CANDIDATES_MARKET_ALERT = [
+    "dbms/MDC/STAT/standard/MDCSTAT14002",
+    "dbms/MDC/STAT/standard/MDCSTAT13301",
+    "dbms/MDC/STAT/standard/MDCSTAT08501",
+]
 
 
 @st.cache_data(ttl=600)
-def get_market_alerts(trd_dd: str) -> pd.DataFrame:
-    """
-    시장경보 종목 현황(투자주의/경고/위험 + 단기과열).
-    ※ bld 값은 KRX 정보데이터시스템에서 크롬 개발자도구로 확인한 값.
-      거래소가 내부 경로를 바꾸면 여기만 수정하면 됨.
-    """
+def try_krx_alerts() -> tuple[pd.DataFrame, str]:
+    today = datetime.now().strftime("%Y%m%d")
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+
     frames = []
-
-    # 단기과열 종목 현황
-    df1 = fetch_krx_bld("dbms/MDC/STAT/standard/MDCSTAT14001", trd_dd)
-    if not df1.empty:
-        df1["구분"] = "단기과열"
-        frames.append(df1)
-
-    # 시장경보 종목(투자주의/경고/위험) 현황
-    df2 = fetch_krx_bld("dbms/MDC/STAT/standard/MDCSTAT14002", trd_dd)
-    if not df2.empty:
-        df2["구분"] = "시장경보"
-        frames.append(df2)
+    for label, candidates in [("단기과열", BLD_CANDIDATES_SHORT_OVERHEAT),
+                              ("시장경보", BLD_CANDIDATES_MARKET_ALERT)]:
+        got = False
+        for bld in candidates:
+            if got:
+                break
+            for dd in (today, yesterday):
+                try:
+                    r = requests.post(
+                        KRX_URL, headers=KRX_HEADERS, timeout=8,
+                        data={"bld": bld, "trdDd": dd, "share": "1",
+                              "money": "1", "csvxls_isNo": "false"},
+                    )
+                    if r.status_code != 200:
+                        continue
+                    js = r.json()
+                    for key in ("OutBlock_1", "output", "block1"):
+                        if key in js and js[key]:
+                            df = pd.DataFrame(js[key])
+                            df["구분"] = label
+                            frames.append(df)
+                            got = True
+                            break
+                    if got:
+                        break
+                except Exception:
+                    continue
 
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True)
+        return pd.DataFrame(), "KRX 엔드포인트 응답 실패 — bld 경로가 변경된 것으로 보입니다."
+    return pd.concat(frames, ignore_index=True), "ok"
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. 현재 시장경보 발령 종목 현황
+# 1. 시장경보 리스트
 # ─────────────────────────────────────────────────────────────
-target_date = get_nearest_business_day()
-
 st.subheader("📢 현재 시장경보 발령 종목 현황")
+with st.expander("이 섹션이 비어있거나 오류가 나면 펼쳐보세요", expanded=False):
+    st.markdown("""
+KRX 정보데이터시스템은 공식 API가 없어 내부 경로(`bld`)를 호출합니다.
+거래소가 경로를 바꾸면 이 섹션만 실패하고, 아래 개별 종목 분석은 정상 동작합니다.
+
+**최신 `bld` 값 찾는 방법:**
+1. `data.krx.co.kr` 접속 → 기본통계 → 주식 → 세부안내 → 단기과열종목 / 시장경보종목
+2. 크롬에서 F12 → Network 탭 → 조회 버튼 클릭
+3. `getJsonData.cmd` 요청의 Payload에서 `bld` 값을 복사해 코드 상단 `BLD_CANDIDATES_*` 리스트 맨 앞에 추가
+""")
+
 try:
-    alert_df = get_market_alerts(target_date)
-    if not alert_df.empty:
+    alert_df, status = try_krx_alerts()
+    if status == "ok" and not alert_df.empty:
         st.dataframe(alert_df, use_container_width=True, hide_index=True)
-        st.caption(f"기준일: {target_date} | 출처: KRX 정보데이터시스템")
+        st.caption(f"기준일: {datetime.now().strftime('%Y-%m-%d')} | 출처: KRX")
     else:
-        st.info("현재 발령된 시장경보 종목이 없거나, KRX 응답이 비어있습니다.")
+        st.info(f"리스트 조회 실패: {status}")
 except Exception as e:
-    st.error(f"리스트 호출 오류: {e}")
-    st.caption("⚠️ KRX가 내부 bld 경로를 변경했을 수 있습니다. "
-               "data.krx.co.kr 에서 개발자도구로 최신 bld 값을 확인해 주세요.")
+    st.warning(f"리스트 조회 중 예외: {e}")
 
 st.divider()
 
@@ -139,8 +139,12 @@ with col_input:
     user_input = st.text_input("📝 분석할 종목코드 6자리 또는 종목명", "010820")
 
 if user_input:
-    with st.spinner("종목명 인덱스 로딩 중..."):
-        name_map = get_ticker_name_map()
+    try:
+        with st.spinner("종목 리스트 로딩 중..."):
+            name_map = get_ticker_name_map()
+    except Exception as e:
+        st.error(f"종목 리스트 로딩 실패: {e}")
+        st.stop()
 
     ticker = resolve_ticker(user_input, name_map)
     if not ticker:
@@ -149,17 +153,18 @@ if user_input:
 
     name = name_map[ticker]
 
-    # OHLCV 로드 (40일 평균 + 여유분)
-    start = (datetime.strptime(target_date, "%Y%m%d")
-             - timedelta(days=200)).strftime("%Y%m%d")
-    df = stock.get_market_ohlcv_by_date(start, target_date, ticker)
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
 
-    if df.empty:
-        st.error("OHLCV 데이터를 불러오지 못했습니다.")
+    try:
+        df = load_ohlcv(ticker, start, end)
+    except Exception as e:
+        st.error(f"OHLCV 로딩 실패: {e}")
         st.stop()
 
-    # 중복 인덱스 제거 + 정렬
-    df = df[~df.index.duplicated(keep="last")].sort_index()
+    if df.empty:
+        st.error("OHLCV 데이터가 비어 있습니다.")
+        st.stop()
 
     with col_date:
         date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
