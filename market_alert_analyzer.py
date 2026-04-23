@@ -973,30 +973,15 @@ with tab3:
                     designated_col = c
                     break
 
-            # 컬럼 제목
-            release_col_name = ("해제 예정일" if category == "단기과열"
-                                else "해제 평가 시작일")
-
-            if designated_col:
-                df = df.copy()
-                df[release_col_name] = df[designated_col].apply(
-                    lambda d: calculate_release_date(category, str(d))
-                )
-            else:
-                df = df.copy()
-                df[release_col_name] = "—"
-
             st.markdown(f"**총 {len(df)}개 종목 지정 중** "
                         f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
 
-            # 핵심 3컬럼만 화이트리스트로 추리기
+            # 핵심 2컬럼만 화이트리스트로 추리기 (종목명, 지정일)
             keep_cols = []
             if name_col and name_col in df.columns:
                 keep_cols.append(name_col)
             if designated_col and designated_col in df.columns:
                 keep_cols.append(designated_col)
-            if release_col_name in df.columns:
-                keep_cols.append(release_col_name)
 
             if keep_cols:
                 df_simple = df[keep_cols].copy()
@@ -1014,15 +999,6 @@ with tab3:
             else:
                 # fallback: 컬럼 못 찾으면 원본 그대로
                 st.dataframe(df, use_container_width=True, hide_index=True)
-
-            # 해제 판단일 설명
-            if category == "단기과열":
-                st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
-                           "단, 지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장될 수 있음.")
-            else:
-                st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
-                           "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
-            st.caption("※ 공휴일은 반영되지 않아 실제 날짜와 ±1~2일 차이날 수 있습니다.")
 
             # 관심종목 일괄 추가
             if name_col and _github_config():
