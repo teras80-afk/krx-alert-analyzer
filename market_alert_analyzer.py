@@ -1,25 +1,26 @@
 """
-시장경보(예고/지정) 실시간 리스트 & 요건 분석기 (FDR 버전)
-────────────────────────────────────────────────────────
-실행 (로컬):    streamlit run market_alert_analyzer.py
-배포 (Cloud):  GitHub 저장소에 올리면 자동 배포
+투경예고 / 단기과열예고 종목 조회기
+────────────────────────────────────────
+종목 하나를 입력하면 현재 해당 종목의
+ - 투자경고 예고 해당 여부
+ - 단기과열 예고 해당 여부
+를 계산해서 한눈에 보여줍니다.
 """
 import streamlit as st
 import pandas as pd
-import requests
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="시장경보 통합 분석기", layout="wide")
-st.title("🚨 시장경보(예고/지정) 실시간 리스트 & 요건 분석")
+st.set_page_config(page_title="예고 상태 조회기", layout="centered")
+st.title("🔍 투경예고 / 단기과열예고 종목 조회")
+st.caption("종목을 입력하면 최근 주가 데이터로 예고 해당 여부를 즉시 판정합니다.")
 
 
 # ─────────────────────────────────────────────────────────────
-# 공용 유틸
+# 데이터 로더
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_ticker_name_map() -> dict:
-    """KRX 상장종목 전체 — 티커→종목명 매핑. FDR 한 번 호출로 끝."""
     df = fdr.StockListing("KRX")
     code_col = "Code" if "Code" in df.columns else "Symbol"
     return dict(zip(df[code_col].astype(str).str.zfill(6), df["Name"]))
@@ -45,185 +46,156 @@ def load_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# KRX 시장경보 리스트 (best-effort)
+# 예고 판정 로직
 # ─────────────────────────────────────────────────────────────
-KRX_URL = "http://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd"
-KRX_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Referer": "http://data.krx.co.kr/contents/MDC/MDI/mdiLoader/",
-}
+def check_warning_alert(df: pd.DataFrame, idx: int) -> dict:
+    """투자경고 예고 판정 — 3대 요건 모두 충족 시 해당"""
+    if idx < 20:
+        return {"status": None, "reason": "데이터 부족(20거래일 미만)"}
 
-BLD_CANDIDATES_SHORT_OVERHEAT = [
-    "dbms/MDC/STAT/standard/MDCSTAT14001",
-    "dbms/MDC/STAT/standard/MDCSTAT13401",
-    "dbms/MDC/STAT/standard/MDCSTAT08401",
-]
-BLD_CANDIDATES_MARKET_ALERT = [
-    "dbms/MDC/STAT/standard/MDCSTAT14002",
-    "dbms/MDC/STAT/standard/MDCSTAT13301",
-    "dbms/MDC/STAT/standard/MDCSTAT08501",
-]
+    curr = int(df["종가"].iloc[idx])
+    p5 = int(df["종가"].iloc[idx - 5])
+    p20 = int(df["종가"].iloc[idx - 20])
+    max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
+
+    c1 = curr >= int(p5 * 1.6)
+    c2 = curr >= int(p20 * 2.0)
+    c3 = curr >= max15
+
+    return {
+        "status": all([c1, c2, c3]),
+        "current": curr,
+        "criteria": [
+            {"label": "5일 전 대비 60% 상승",
+             "base": p5, "threshold": int(p5 * 1.6), "pass": c1},
+            {"label": "20일 전 대비 100% 상승",
+             "base": p20, "threshold": int(p20 * 2.0), "pass": c2},
+            {"label": "15거래일 중 최고가",
+             "base": max15, "threshold": max15, "pass": c3},
+        ],
+    }
 
 
-@st.cache_data(ttl=600)
-def try_krx_alerts() -> tuple[pd.DataFrame, str]:
-    today = datetime.now().strftime("%Y%m%d")
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+def check_overheat_alert(df: pd.DataFrame, idx: int) -> dict:
+    """단기과열 예고 판정 — 주가 요건 (거래회전율·변동성은 별도)"""
+    if idx < 39:
+        return {"status": None, "reason": "데이터 부족(40거래일 미만)"}
 
-    frames = []
-    for label, candidates in [("단기과열", BLD_CANDIDATES_SHORT_OVERHEAT),
-                              ("시장경보", BLD_CANDIDATES_MARKET_ALERT)]:
-        got = False
-        for bld in candidates:
-            if got:
-                break
-            for dd in (today, yesterday):
-                try:
-                    r = requests.post(
-                        KRX_URL, headers=KRX_HEADERS, timeout=8,
-                        data={"bld": bld, "trdDd": dd, "share": "1",
-                              "money": "1", "csvxls_isNo": "false"},
-                    )
-                    if r.status_code != 200:
-                        continue
-                    js = r.json()
-                    for key in ("OutBlock_1", "output", "block1"):
-                        if key in js and js[key]:
-                            df = pd.DataFrame(js[key])
-                            df["구분"] = label
-                            frames.append(df)
-                            got = True
-                            break
-                    if got:
-                        break
-                except Exception:
-                    continue
+    curr = int(df["종가"].iloc[idx])
+    avg40 = df["종가"].iloc[idx - 39: idx + 1].mean()
+    threshold = int(avg40 * 1.3)
 
-    if not frames:
-        return pd.DataFrame(), "KRX 엔드포인트 응답 실패 — bld 경로가 변경된 것으로 보입니다."
-    return pd.concat(frames, ignore_index=True), "ok"
+    return {
+        "status": curr >= threshold,
+        "current": curr,
+        "avg40": int(avg40),
+        "threshold": threshold,
+    }
 
 
 # ─────────────────────────────────────────────────────────────
-# 1. 시장경보 리스트
+# UI
 # ─────────────────────────────────────────────────────────────
-st.subheader("📢 현재 시장경보 발령 종목 현황")
-with st.expander("이 섹션이 비어있거나 오류가 나면 펼쳐보세요", expanded=False):
-    st.markdown("""
-KRX 정보데이터시스템은 공식 API가 없어 내부 경로(`bld`)를 호출합니다.
-거래소가 경로를 바꾸면 이 섹션만 실패하고, 아래 개별 종목 분석은 정상 동작합니다.
+user_input = st.text_input("📝 종목코드 6자리 또는 종목명",
+                           value="009150",
+                           placeholder="예: 삼성전자 또는 005930")
 
-**최신 `bld` 값 찾는 방법:**
-1. `data.krx.co.kr` 접속 → 기본통계 → 주식 → 세부안내 → 단기과열종목 / 시장경보종목
-2. 크롬에서 F12 → Network 탭 → 조회 버튼 클릭
-3. `getJsonData.cmd` 요청의 Payload에서 `bld` 값을 복사해 코드 상단 `BLD_CANDIDATES_*` 리스트 맨 앞에 추가
-""")
+if not user_input:
+    st.stop()
 
 try:
-    alert_df, status = try_krx_alerts()
-    if status == "ok" and not alert_df.empty:
-        st.dataframe(alert_df, use_container_width=True, hide_index=True)
-        st.caption(f"기준일: {datetime.now().strftime('%Y-%m-%d')} | 출처: KRX")
-    else:
-        st.info(f"리스트 조회 실패: {status}")
+    name_map = get_ticker_name_map()
 except Exception as e:
-    st.warning(f"리스트 조회 중 예외: {e}")
+    st.error(f"종목 리스트 로딩 실패: {e}")
+    st.stop()
 
-st.divider()
+ticker = resolve_ticker(user_input, name_map)
+if not ticker:
+    st.error("종목을 찾지 못했습니다. 6자리 코드나 정확한 종목명을 입력하세요.")
+    st.stop()
 
-# ─────────────────────────────────────────────────────────────
-# 2. 특정 종목 지정 요건 정밀 분석
-# ─────────────────────────────────────────────────────────────
-col_input, col_date = st.columns([2, 1])
-with col_input:
-    user_input = st.text_input("📝 분석할 종목코드 6자리 또는 종목명", "010820")
+name = name_map[ticker]
 
-if user_input:
-    try:
-        with st.spinner("종목 리스트 로딩 중..."):
-            name_map = get_ticker_name_map()
-    except Exception as e:
-        st.error(f"종목 리스트 로딩 실패: {e}")
-        st.stop()
+end = datetime.now().strftime("%Y-%m-%d")
+start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
 
-    ticker = resolve_ticker(user_input, name_map)
-    if not ticker:
-        st.error("종목을 찾지 못했습니다. 6자리 코드 또는 정확한 종목명을 입력하세요.")
-        st.stop()
+try:
+    df = load_ohlcv(ticker, start, end)
+except Exception as e:
+    st.error(f"주가 데이터 로딩 실패: {e}")
+    st.stop()
 
-    name = name_map[ticker]
+if df.empty:
+    st.error("주가 데이터가 비어 있습니다.")
+    st.stop()
 
-    end = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
+# 기준일 선택
+date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
+selected_date = st.selectbox("📅 기준일", date_list, index=0,
+                              help="기본값은 가장 최근 거래일입니다.")
 
-    try:
-        df = load_ohlcv(ticker, start, end)
-    except Exception as e:
-        st.error(f"OHLCV 로딩 실패: {e}")
-        st.stop()
+base_idx = df.index.get_loc(pd.Timestamp(selected_date))
+if isinstance(base_idx, slice):
+    base_idx = base_idx.stop - 1
 
-    if df.empty:
-        st.error("OHLCV 데이터가 비어 있습니다.")
-        st.stop()
+# ═══════════════════════════════════════════════════════════
+# 결과 표시 — 한눈에 보이게
+# ═══════════════════════════════════════════════════════════
+st.markdown(f"### 📍 {name} ({ticker})")
+curr_p = int(df["종가"].iloc[base_idx])
+st.markdown(f"**{selected_date} 종가:** {curr_p:,}원")
 
-    with col_date:
-        date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
-        selected_date = st.selectbox("📅 판단 기준일(T) 선택", date_list, index=0)
+st.markdown("---")
 
-    base_idx = df.index.get_loc(pd.Timestamp(selected_date))
-    if isinstance(base_idx, slice):
-        base_idx = base_idx.stop - 1
+warn = check_warning_alert(df, base_idx)
+overheat = check_overheat_alert(df, base_idx)
 
-    curr_p = int(df["종가"].iloc[base_idx])
+col1, col2 = st.columns(2)
 
-    st.subheader(f"📍 {name} ({ticker}) 지정 요건 검토")
-    st.markdown(f"**기준일 종가: {curr_p:,}원**")
+with col1:
+    st.markdown("#### ⚠️ 투자경고 예고")
+    if warn["status"] is None:
+        st.info(warn["reason"])
+    elif warn["status"]:
+        st.error("🔴 **예고 해당**\n\n3대 요건 모두 충족")
+    else:
+        n_pass = sum(1 for c in warn["criteria"] if c["pass"])
+        st.success(f"🟢 **미해당**\n\n충족 요건: {n_pass} / 3")
 
-    tab1, tab2 = st.tabs(["⚠️ 투자경고 지정 요건", "🔥 단기과열 지정 요건"])
+with col2:
+    st.markdown("#### 🔥 단기과열 예고")
+    if overheat["status"] is None:
+        st.info(overheat["reason"])
+    elif overheat["status"]:
+        st.error("🔴 **주가요건 충족**\n\n(회전율·변동성 별도 확인 필요)")
+    else:
+        diff = overheat["threshold"] - overheat["current"]
+        st.success(f"🟢 **미해당**\n\n기준가까지 {diff:,}원 남음")
 
-    with tab1:
-        st.write("### [투자경고 표준 3대 요건]")
-        if base_idx < 20:
-            st.warning(f"기준일 이전 영업일이 {base_idx}일뿐이라 20일 비교가 불가합니다.")
-        else:
-            t_5_p = int(df["종가"].iloc[base_idx - 5])
-            t_20_p = int(df["종가"].iloc[base_idx - 20])
-            max_15_p = int(df["종가"].iloc[base_idx - 14: base_idx + 1].max())
+st.markdown("---")
 
-            c1 = curr_p >= int(t_5_p * 1.6)
-            c2 = curr_p >= int(t_20_p * 2.0)
-            c3 = curr_p >= max_15_p
+# 상세 내역
+with st.expander("📋 투자경고 예고 상세 요건", expanded=False):
+    if warn["status"] is None:
+        st.info(warn["reason"])
+    else:
+        for c in warn["criteria"]:
+            mark = "✅" if c["pass"] else "❌"
+            st.write(f"{mark} **{c['label']}**  "
+                     f"기준가 {c['threshold']:,}원 vs 현재가 {curr_p:,}원")
+        st.caption("※ 3개 요건 모두 충족 시 '예고 해당'으로 판정. "
+                   "특수 지정예고(초단기·중기 등)는 별도 KRX 공시 확인 필요.")
 
-            st.write(f"{'✅' if c1 else '❌'} 1. **5일 전({t_5_p:,}원)** 대비 60% 상승"
-                     f" (기준가: {int(t_5_p*1.6):,}원)")
-            st.write(f"{'✅' if c2 else '❌'} 2. **20일 전({t_20_p:,}원)** 대비 100% 상승"
-                     f" (기준가: {int(t_20_p*2.0):,}원)")
-            st.write(f"{'✅' if c3 else '❌'} 3. 당일 종가가 최근 **15거래일 중 최고가**"
-                     f" (최고: {max_15_p:,}원)")
+with st.expander("📋 단기과열 예고 상세 요건", expanded=False):
+    if overheat["status"] is None:
+        st.info(overheat["reason"])
+    else:
+        st.write(f"- 40거래일 평균 종가: **{overheat['avg40']:,}원**")
+        st.write(f"- 지정 기준가(평균×130%): **{overheat['threshold']:,}원**")
+        st.write(f"- 현재 종가: **{overheat['current']:,}원**")
+        st.caption("※ 단기과열은 주가 요건 외에 거래회전율·변동성 요건이 "
+                   "모두 충족되어야 실제 예고 지정. 주가만으로는 부분 판정입니다.")
 
-            if c1 and c2 and c3:
-                st.error("🚨 투자경고 지정 가능성이 매우 높습니다 (모든 요건 충족).")
-            else:
-                st.warning("💡 일부 요건 미달 (특수 지정예고는 별도 공시 확인 필요).")
-
-    with tab2:
-        st.write("### [단기과열 주가 요건]")
-        if base_idx < 39:
-            st.warning(f"기준일 이전 영업일이 {base_idx}일뿐이라 40일 평균 계산이 불가합니다.")
-        else:
-            avg_40_p = df["종가"].iloc[base_idx - 39: base_idx + 1].mean()
-            over_p_limit = int(avg_40_p * 1.3)
-            check_over = curr_p >= over_p_limit
-
-            st.write(f"최근 40거래일 평균 종가: {int(avg_40_p):,}원")
-            st.write(f"지정 기준가 (평균 대비 130%): **{over_p_limit:,}원**")
-
-            if check_over:
-                diff = curr_p - over_p_limit
-                st.error(f"✅ 주가 요건 충족 (현재가가 {diff:,}원 높음)")
-            else:
-                diff = over_p_limit - curr_p
-                st.success(f"❌ 주가 요건 미달 (기준가까지 {diff:,}원 남음)")
-
-            st.caption("※ 단기과열은 주가 외에 거래회전율·변동성 요건이 모두 "
-                       "충족되어야 하며, 실제 지정은 거래소 공시로 최종 확인 필요.")
+st.markdown("---")
+st.caption("📌 본 도구는 공개 주가 데이터로 요건을 자체 계산합니다. "
+           "최종 지정 여부는 한국거래소 공식 공시를 확인하세요.")
