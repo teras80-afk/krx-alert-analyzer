@@ -1,23 +1,23 @@
 """
-투경예고 / 단기과열예고 임계값 조회기 + 관심종목 대시보드
-────────────────────────────────────────────────────────
- [1] 개별 종목 조회
- [2] 관심종목 대시보드 (앱 내 편집 → GitHub 자동 저장)
-
-단기과열 판정 — KRX 일반종목 3대 요건 모두 구현:
- ① 주가: 당일 종가 ≥ 40일 평균 종가 × 1.3
- ② 회전율: 최근 2일 평균 거래량 ≥ 40일 평균 거래량 × 6
- ③ 변동성: 최근 2일 평균 (고-저)/전일종가 ≥ 40일 평균 × 1.5
+투경예고 / 단기과열예고 임계값 조회기 + 관심종목 대시보드 + 현재 지정종목
+────────────────────────────────────────────────────────────────────
+ [1] 개별 종목 조회 (차트 포함)
+ [2] 관심종목 대시보드 (GitHub 저장 + 근접 경고)
+ [3] 현재 지정종목 (네이버 금융 실시간 반영, 지정해제 시 자동 제외)
 """
 import streamlit as st
 import pandas as pd
 import requests
 import base64
+import altair as alt
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
+from io import StringIO
 
 st.set_page_config(page_title="예고 임계값 조회기", layout="wide")
 st.title("🔍 투경예고 / 단기과열예고 조회")
+
+PROXIMITY_PCT = 0.95
 
 
 # ─────────────────────────────────────────────────────────────
@@ -50,6 +50,70 @@ def load_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
+# 현재 지정종목 스크래핑 (네이버 금융)
+# ─────────────────────────────────────────────────────────────
+NAVER_URLS = {
+    "투자경고": [
+        "https://finance.naver.com/sise/investment_alert.naver?type=warning",
+        "https://finance.naver.com/sise/investment_alert.nhn?type=warning",
+    ],
+    "투자위험": [
+        "https://finance.naver.com/sise/investment_alert.naver?type=risk",
+        "https://finance.naver.com/sise/investment_alert.nhn?type=risk",
+    ],
+    "단기과열": [
+        "https://finance.naver.com/sise/investment_alert.naver?type=short_period",
+        "https://finance.naver.com/sise/investment_alert.nhn?type=short_period",
+    ],
+}
+
+
+@st.cache_data(ttl=600)
+def fetch_designated_stocks(category: str) -> tuple[pd.DataFrame, str]:
+    """네이버 금융에서 지정종목 리스트 스크래핑"""
+    urls = NAVER_URLS.get(category, [])
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+    }
+
+    last_err = ""
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=10)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+
+            # 네이버는 EUC-KR 인코딩
+            html = r.content.decode("euc-kr", errors="replace")
+
+            # pandas read_html로 테이블 추출
+            tables = pd.read_html(StringIO(html))
+
+            # 가장 행이 많은 테이블이 종목 리스트
+            best = None
+            for t in tables:
+                if len(t) > 0 and "종목명" in str(t.columns.tolist()):
+                    if best is None or len(t) > len(best):
+                        best = t
+            if best is None and tables:
+                # 종목명 컬럼이 없으면 가장 큰 테이블
+                best = max(tables, key=len)
+
+            if best is not None and len(best) > 0:
+                # NaN 행 제거
+                best = best.dropna(how="all").reset_index(drop=True)
+                return best, "ok"
+        except Exception as e:
+            last_err = str(e)[:100]
+            continue
+
+    return pd.DataFrame(), f"데이터 조회 실패: {last_err}"
+
+
+# ─────────────────────────────────────────────────────────────
 # GitHub 연동
 # ─────────────────────────────────────────────────────────────
 def _github_config():
@@ -64,7 +128,7 @@ def _github_config():
         return None
 
 
-def github_get_watchlist() -> tuple[str, str | None]:
+def github_get_watchlist():
     cfg = _github_config()
     if not cfg:
         return "", None
@@ -82,15 +146,15 @@ def github_get_watchlist() -> tuple[str, str | None]:
     return "", None
 
 
-def github_put_watchlist(new_content: str, sha: str | None) -> tuple[bool, str]:
+def github_put_watchlist(new_content, sha):
     cfg = _github_config()
     if not cfg:
-        return False, "GitHub 연동 설정이 없습니다"
+        return False, "GitHub 연동 설정 없음"
     url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
     headers = {"Authorization": f"Bearer {cfg['token']}",
                "Accept": "application/vnd.github+json"}
     body = {
-        "message": f"Update watchlist via app ({datetime.now():%Y-%m-%d %H:%M})",
+        "message": f"Update watchlist ({datetime.now():%Y-%m-%d %H:%M})",
         "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
         "branch": cfg["branch"],
     }
@@ -99,98 +163,173 @@ def github_put_watchlist(new_content: str, sha: str | None) -> tuple[bool, str]:
     try:
         r = requests.put(url, headers=headers, json=body, timeout=10)
         if r.status_code in (200, 201):
-            return True, "✅ GitHub에 저장 완료!"
-        return False, f"❌ HTTP {r.status_code}: {r.text[:200]}"
+            return True, "✅ 저장 완료"
+        return False, f"❌ HTTP {r.status_code}"
     except Exception as e:
         return False, f"❌ {e}"
 
 
-def parse_watchlist(text: str) -> list:
+def parse_watchlist(text):
     return [ln.strip() for ln in text.splitlines()
             if ln.strip() and not ln.startswith("#")]
 
 
+def add_to_watchlist(stock_names: list) -> str:
+    """관심종목 리스트에 종목 추가 (중복 제외)"""
+    current_text = st.session_state.get("watchlist_text", "")
+    current_set = set(parse_watchlist(current_text))
+    to_add = [n for n in stock_names if n and n not in current_set]
+    if not to_add:
+        return "이미 모두 관심종목에 있습니다"
+    new_lines = current_text.rstrip() + "\n" + "\n".join(to_add)
+    ok, msg = github_put_watchlist(new_lines,
+                                    st.session_state.get("watchlist_sha"))
+    if ok:
+        st.session_state.watchlist_text = new_lines
+        _, new_sha = github_get_watchlist()
+        st.session_state.watchlist_sha = new_sha
+        return f"✅ {len(to_add)}개 종목 추가됨"
+    return f"❌ 저장 실패: {msg}"
+
+
 # ─────────────────────────────────────────────────────────────
-# 예고 판정 로직 (핵심)
+# 이상상태 & 예고 판정
 # ─────────────────────────────────────────────────────────────
-def evaluate_warning(df: pd.DataFrame, idx: int) -> dict:
-    """투자경고 3대 요건 판정"""
+def detect_anomaly(df):
+    if df.empty:
+        return {"anomaly": True, "reason": "데이터 없음"}
+    recent5 = df["거래량"].tail(5)
+    zero_days = int((recent5 == 0).sum())
+    if zero_days >= 3:
+        return {"anomaly": True,
+                "reason": f"최근 5거래일 중 {zero_days}일 거래량 0"}
+    try:
+        days_ago = (pd.Timestamp.now().normalize()
+                    - df.index[-1].normalize()).days
+    except Exception:
+        days_ago = 0
+    if days_ago > 10:
+        return {"anomaly": True, "reason": f"최종 거래일이 {days_ago}일 전"}
+    return {"anomaly": False, "reason": ""}
+
+
+def evaluate_warning(df, idx):
     curr = int(df["종가"].iloc[idx])
     if idx < 20:
-        return {"status": None, "reason": "데이터 부족(20거래일 미만)"}
-
+        return {"status": None, "reason": "데이터 부족"}
     p5 = int(df["종가"].iloc[idx - 5])
     p20 = int(df["종가"].iloc[idx - 20])
     max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
-
     th1, th2, th3 = int(p5 * 1.6), int(p20 * 2.0), max15
     c1, c2, c3 = curr >= th1, curr >= th2, curr >= th3
-
+    ratios = [curr / th1 if th1 else 0, curr / th2 if th2 else 0,
+              curr / th3 if th3 else 0]
     return {
-        "status": all([c1, c2, c3]),
-        "current": curr,
+        "status": all([c1, c2, c3]), "current": curr,
+        "thresholds": {"5일x1.6": th1, "20일x2.0": th2, "15일최고": th3},
         "criteria": [
-            ("① 5일 전 × 1.6", th1, c1),
-            ("② 20일 전 × 2.0", th2, c2),
-            ("③ 15일 최고가", th3, c3),
+            ("① 5일 전 × 1.6", th1, c1, ratios[0]),
+            ("② 20일 전 × 2.0", th2, c2, ratios[1]),
+            ("③ 15일 최고가", th3, c3, ratios[2]),
         ],
+        "max_ratio": max(ratios),
     }
 
 
-def evaluate_overheat(df: pd.DataFrame, idx: int) -> dict:
-    """단기과열 3대 요건 판정 (일반종목 기준)"""
-    if idx < 40:  # 40일 평균 + 최근 2일 + 변동성용 전일종가 1일
-        return {"status": None, "reason": "데이터 부족(40거래일 미만)"}
-
+def evaluate_overheat(df, idx):
+    if idx < 40:
+        return {"status": None, "reason": "데이터 부족"}
     curr = int(df["종가"].iloc[idx])
-
-    # ① 주가: 당일 종가 >= 40일 평균 종가 × 1.3
     avg40_close = df["종가"].iloc[idx - 39: idx + 1].mean()
     price_th = int(avg40_close * 1.3)
     c1 = curr >= price_th
-
-    # ② 회전율: 최근 2일 평균 거래량 >= 40일 평균 거래량 × 6
+    r1 = curr / price_th if price_th else 0
     avg2_vol = df["거래량"].iloc[idx - 1: idx + 1].mean()
     avg40_vol = df["거래량"].iloc[idx - 39: idx + 1].mean()
     vol_ratio = avg2_vol / avg40_vol if avg40_vol > 0 else 0
     c2 = vol_ratio >= 6.0
-
-    # ③ 변동성: 최근 2일 평균 변동성(고-저)/전일종가 >= 40일 평균 × 1.5
+    r2 = vol_ratio / 6.0
     prev_close = df["종가"].shift(1)
     daily_vola = (df["고가"] - df["저가"]) / prev_close
     avg2_vola = daily_vola.iloc[idx - 1: idx + 1].mean()
     avg40_vola = daily_vola.iloc[idx - 39: idx + 1].mean()
     vola_ratio = avg2_vola / avg40_vola if avg40_vola > 0 else 0
     c3 = vola_ratio >= 1.5
-
+    r3 = vola_ratio / 1.5
     return {
-        "status": all([c1, c2, c3]),
-        "current": curr,
+        "status": all([c1, c2, c3]), "current": curr,
+        "thresholds": {"주가x1.3": price_th},
         "criteria": [
-            ("① 주가 (40일평균 × 1.3)",
-             f"{price_th:,}원", f"{curr:,}원", c1),
-            ("② 회전율 (40일평균 × 6배)",
-             f"{avg40_vol * 6:,.0f}주", f"{avg2_vol:,.0f}주 ({vol_ratio:.2f}배)", c2),
-            ("③ 변동성 (40일평균 × 1.5배)",
-             f"{avg40_vola * 1.5 * 100:.2f}%",
-             f"{avg2_vola * 100:.2f}% ({vola_ratio:.2f}배)", c3),
+            ("① 주가 (40일평균 × 1.3)", f"{price_th:,}원",
+             f"{curr:,}원", c1, r1),
+            ("② 회전율 (40일평균 × 6배)", f"{avg40_vol * 6:,.0f}주",
+             f"{avg2_vol:,.0f}주 ({vol_ratio:.2f}배)", c2, r2),
+            ("③ 변동성 (40일평균 × 1.5배)", f"{avg40_vola * 1.5 * 100:.2f}%",
+             f"{avg2_vola * 100:.2f}% ({vola_ratio:.2f}배)", c3, r3),
         ],
+        "max_ratio": max(r1, r2, r3),
     }
 
 
-def fmt_warning_table(ev: dict) -> pd.DataFrame:
-    rows = [{"조건": k, "임계값(발동가)": f"{th:,}원",
-             "현재가": f"{ev['current']:,}원",
-             "충족": "✅" if ok else "❌"}
-            for (k, th, ok) in ev["criteria"]]
-    return pd.DataFrame(rows)
+def status_label(ev):
+    if ev.get("status") is None:
+        return "—", 99
+    if ev["status"]:
+        return "🔴 해당", 0
+    n_crit = len(ev["criteria"])
+    n_ok = sum(1 for row in ev["criteria"] if row[2])
+    max_r = ev.get("max_ratio", 0)
+    if max_r >= PROXIMITY_PCT:
+        return f"🟡 근접 ({int(max_r*100)}%, {n_ok}/{n_crit})", 1
+    return f"🟢 {n_ok}/{n_crit}", 2
 
 
-def fmt_overheat_table(ev: dict) -> pd.DataFrame:
-    rows = [{"조건": k, "기준값": th, "현재값": cur,
-             "충족": "✅" if ok else "❌"}
-            for (k, th, cur, ok) in ev["criteria"]]
-    return pd.DataFrame(rows)
+def fmt_warning_table(ev):
+    return pd.DataFrame([
+        {"조건": k, "임계값": f"{th:,}원",
+         "현재가": f"{ev['current']:,}원",
+         "근접도": f"{r*100:.1f}%",
+         "충족": "✅" if ok else "❌"}
+        for (k, th, ok, r) in ev["criteria"]])
+
+
+def fmt_overheat_table(ev):
+    return pd.DataFrame([
+        {"조건": k, "기준값": th, "현재값": cur,
+         "근접도": f"{r*100:.1f}%",
+         "충족": "✅" if ok else "❌"}
+        for (k, th, cur, ok, r) in ev["criteria"]])
+
+
+def build_price_chart(df, warn_ev, oh_ev, days=60):
+    recent = df.tail(days).reset_index()
+    recent = recent.rename(columns={recent.columns[0]: "날짜"})
+    base = alt.Chart(recent).mark_line(point=True, color="#d35400").encode(
+        x=alt.X("날짜:T", title=""),
+        y=alt.Y("종가:Q", title="종가 (원)", scale=alt.Scale(zero=False)),
+        tooltip=["날짜:T", alt.Tooltip("종가:Q", format=",")]
+    ).properties(height=340)
+    layers = [base]
+
+    def hline(v, label, color, dash):
+        rule_df = pd.DataFrame({"y": [v], "label": [label]})
+        rule = alt.Chart(rule_df).mark_rule(
+            color=color, strokeDash=dash, size=1.5
+        ).encode(y="y:Q")
+        text = alt.Chart(rule_df).mark_text(
+            align="left", dx=5, dy=-5, color=color, fontSize=11
+        ).encode(x=alt.value(5), y="y:Q", text="label:N")
+        return [rule, text]
+
+    if warn_ev.get("thresholds"):
+        t = warn_ev["thresholds"]
+        layers += hline(t["5일x1.6"], "투경 ① 5일×1.6", "#c0392b", [4, 4])
+        layers += hline(t["20일x2.0"], "투경 ② 20일×2.0", "#8e44ad", [4, 4])
+        layers += hline(t["15일최고"], "투경 ③ 15일최고", "#16a085", [4, 4])
+    if oh_ev.get("thresholds"):
+        layers += hline(oh_ev["thresholds"]["주가x1.3"],
+                        "단기과열 ① 주가×1.3", "#2980b9", [2, 2])
+    return alt.layer(*layers).resolve_scale(y="shared")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -204,9 +343,13 @@ except Exception as e:
 
 
 # ═══════════════════════════════════════════════════════════
-# 탭
+# 탭 3개
 # ═══════════════════════════════════════════════════════════
-tab1, tab2 = st.tabs(["🎯 개별 종목 조회", "📋 관심종목 대시보드"])
+tab1, tab2, tab3 = st.tabs([
+    "🎯 개별 종목 조회",
+    "📋 관심종목 대시보드",
+    "📌 현재 지정종목",
+])
 
 # ───────────────────────────────────────────────────────────
 # 탭 1: 개별 종목 조회
@@ -235,6 +378,10 @@ with tab1:
             if df.empty:
                 st.error("주가 데이터가 비어 있습니다.")
             else:
+                anomaly = detect_anomaly(df)
+                if anomaly["anomaly"]:
+                    st.warning(f"🚨 **이상상태 감지**: {anomaly['reason']}")
+
                 with col_date_space:
                     date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
                     selected_date = st.selectbox("기준일", date_list, index=0,
@@ -259,11 +406,14 @@ with tab1:
                     st.markdown("#### ⚠️ 투자경고 예고")
                     if warn_ev["status"] is None:
                         st.info(warn_ev["reason"])
-                    elif warn_ev["status"]:
-                        st.error("🔴 예고 해당 — 3대 요건 모두 충족")
                     else:
-                        n_ok = sum(1 for _, _, ok in warn_ev["criteria"] if ok)
-                        st.success(f"🟢 미해당 — 충족 {n_ok}/3")
+                        label, _ = status_label(warn_ev)
+                        if warn_ev["status"]:
+                            st.error(f"{label} — 3대 요건 모두 충족")
+                        elif "근접" in label:
+                            st.warning(f"{label} — 근접 중")
+                        else:
+                            st.success(label)
                     if warn_ev.get("criteria"):
                         st.dataframe(fmt_warning_table(warn_ev),
                                      use_container_width=True, hide_index=True)
@@ -272,17 +422,26 @@ with tab1:
                     st.markdown("#### 🔥 단기과열 예고")
                     if oh_ev["status"] is None:
                         st.info(oh_ev["reason"])
-                    elif oh_ev["status"]:
-                        st.error("🔴 예고 해당 — 주가·회전율·변동성 모두 충족")
                     else:
-                        n_ok = sum(1 for _, _, _, ok in oh_ev["criteria"] if ok)
-                        if n_ok >= 2:
-                            st.warning(f"🟡 일부 충족 ({n_ok}/3) — 예고 미해당")
+                        label, _ = status_label(oh_ev)
+                        if oh_ev["status"]:
+                            st.error(f"{label} — 3대 요건 모두 충족")
+                        elif "근접" in label:
+                            st.warning(f"{label} — 근접 중")
                         else:
-                            st.success(f"🟢 미해당 ({n_ok}/3)")
+                            st.success(label)
                     if oh_ev.get("criteria"):
                         st.dataframe(fmt_overheat_table(oh_ev),
                                      use_container_width=True, hide_index=True)
+
+                st.markdown("---")
+                st.markdown("#### 📈 최근 60일 종가 + 임계값")
+                try:
+                    chart = build_price_chart(df, warn_ev, oh_ev)
+                    st.altair_chart(chart, use_container_width=True)
+                    st.caption("점선 = 각 조건의 임계값.")
+                except Exception as e:
+                    st.info(f"차트 생성 생략: {e}")
 
 
 # ───────────────────────────────────────────────────────────
@@ -298,28 +457,25 @@ with tab2:
     with col_mode:
         edit_mode = st.toggle("✏️ 편집 모드", value=False)
     with col_reload:
-        if st.button("🔄 GitHub에서 새로고침"):
+        if st.button("🔄 GitHub에서 새로고침", key="watchlist_reload"):
             content, sha = github_get_watchlist()
             if content:
                 st.session_state.watchlist_text = content
                 st.session_state.watchlist_sha = sha
-                st.success("최신 내용으로 갱신되었습니다.")
+                st.success("갱신됨")
                 st.rerun()
 
     if edit_mode:
-        st.markdown("**📝 관심종목 편집** — 한 줄에 하나씩")
         new_text = st.text_area(
-            "편집창",
-            value=st.session_state.watchlist_text,
-            height=250,
+            "편집창", value=st.session_state.watchlist_text, height=250,
             label_visibility="collapsed",
         )
         col_save, col_cancel = st.columns([1, 1])
         with col_save:
             if st.button("💾 GitHub에 저장", type="primary",
-                         use_container_width=True):
+                         use_container_width=True, key="watchlist_save"):
                 if _github_config() is None:
-                    st.error("GitHub 연동 미설정. Secrets 확인 필요.")
+                    st.error("GitHub 연동 미설정")
                 else:
                     ok, msg = github_put_watchlist(
                         new_text, st.session_state.watchlist_sha)
@@ -331,81 +487,140 @@ with tab2:
                     else:
                         st.error(msg)
         with col_cancel:
-            if st.button("↩️ 변경 취소", use_container_width=True):
+            if st.button("↩️ 변경 취소", use_container_width=True,
+                         key="watchlist_cancel"):
                 st.rerun()
     else:
         lines = parse_watchlist(st.session_state.watchlist_text)
-
         if not lines:
-            st.warning("관심종목이 없습니다. 편집 모드를 켜세요.")
+            st.warning("관심종목 없음. 편집 모드를 켜세요.")
         else:
             st.caption(f"등록된 관심종목: **{len(lines)}개**")
-
-            if st.button("🔄 전체 조회", type="primary"):
+            if st.button("🔄 전체 조회", type="primary", key="watchlist_scan"):
                 end = datetime.now().strftime("%Y-%m-%d")
                 start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
-
                 rows = []
                 progress = st.progress(0, text="조회 중...")
-
                 for i, line in enumerate(lines):
-                    progress.progress((i + 1) / len(lines), text=f"조회 중... {line}")
+                    progress.progress((i + 1) / len(lines),
+                                       text=f"조회 중... {line}")
                     ticker = resolve_ticker(line, name_map)
                     if not ticker:
                         rows.append({"종목": line, "코드": "—", "종가": "—",
-                                     "투경예고": "❓", "단기과열예고": "❓",
-                                     "_정렬": 99})
+                                     "상태": "❓", "투경예고": "❓",
+                                     "단기과열예고": "❓", "_정렬": 99})
                         continue
-
                     name = name_map[ticker]
                     try:
                         df = load_ohlcv(ticker, start, end)
                         if df.empty:
                             raise ValueError
                         idx = len(df) - 1
+                        anomaly = detect_anomaly(df)
                         warn_ev = evaluate_warning(df, idx)
                         oh_ev = evaluate_overheat(df, idx)
                     except Exception:
                         rows.append({"종목": name, "코드": ticker, "종가": "—",
-                                     "투경예고": "❓", "단기과열예고": "❓",
-                                     "_정렬": 99})
+                                     "상태": "❓", "투경예고": "❓",
+                                     "단기과열예고": "❓", "_정렬": 99})
                         continue
-
                     curr = int(df["종가"].iloc[-1])
-
-                    def mark(ev, count_total=3):
-                        if ev["status"] is None:
-                            return "—"
-                        if ev["status"]:
-                            return "🔴 해당"
-                        n_ok = sum(1 for row in ev["criteria"]
-                                   if row[-1])
-                        return f"🟢 {n_ok}/{count_total}"
-
-                    rank = 0 if (warn_ev["status"] or oh_ev["status"]) else 1
-
+                    warn_label, warn_rank = status_label(warn_ev)
+                    oh_label, oh_rank = status_label(oh_ev)
+                    rank = min(warn_rank, oh_rank)
+                    if anomaly["anomaly"] and rank >= 2:
+                        rank = 1.5
                     rows.append({
                         "종목": name, "코드": ticker,
                         "종가": f"{curr:,}원",
-                        "투경예고": mark(warn_ev),
-                        "단기과열예고": mark(oh_ev),
+                        "상태": "🚨 이상" if anomaly["anomaly"] else "정상",
+                        "투경예고": warn_label,
+                        "단기과열예고": oh_label,
                         "_정렬": rank,
                     })
-
                 progress.empty()
-                df_sum = pd.DataFrame(rows).sort_values("_정렬").drop(columns=["_정렬"])
-
+                df_sum = pd.DataFrame(rows).sort_values("_정렬").drop(
+                    columns=["_정렬"])
                 alerts = (df_sum["투경예고"].str.contains("🔴").sum()
                           + df_sum["단기과열예고"].str.contains("🔴").sum())
+                proximals = (df_sum["투경예고"].str.contains("🟡").sum()
+                             + df_sum["단기과열예고"].str.contains("🟡").sum())
+                anomalies = df_sum["상태"].str.contains("🚨").sum()
+                msg_parts = []
                 if alerts > 0:
-                    st.error(f"🚨 예고 해당: **{alerts}건**")
+                    msg_parts.append(f"🔴 예고해당 **{alerts}건**")
+                if proximals > 0:
+                    msg_parts.append(f"🟡 근접 **{proximals}건**")
+                if anomalies > 0:
+                    msg_parts.append(f"🚨 이상 **{anomalies}건**")
+                if msg_parts:
+                    if alerts > 0:
+                        st.error(" / ".join(msg_parts))
+                    else:
+                        st.warning(" / ".join(msg_parts))
                 else:
-                    st.success("✅ 예고 해당 없음")
-
+                    st.success("✅ 전체 정상")
                 st.dataframe(df_sum, use_container_width=True, hide_index=True)
-                st.caption(f"기준일: {end} | 조회 {len(lines)}개")
+                st.caption(f"기준일: {end} | {len(lines)}개")
+
+
+# ───────────────────────────────────────────────────────────
+# 탭 3: 현재 지정종목
+# ───────────────────────────────────────────────────────────
+with tab3:
+    st.caption("현재 한국거래소에 지정된 종목 리스트입니다. "
+               "네이버 금융에서 실시간 조회하며, **지정이 해제되면 자동으로 리스트에서 빠집니다.** "
+               "캐시는 10분이라 갱신이 느리면 아래 새로고침 버튼을 누르세요.")
+
+    if st.button("🔄 지정종목 새로고침", key="designated_reload"):
+        st.cache_data.clear()
+        st.rerun()
+
+    sub1, sub2, sub3 = st.tabs(["🚧 투자경고", "⚠️ 투자위험", "🔥 단기과열"])
+
+    def render_designated(category: str, container):
+        with container:
+            with st.spinner(f"{category} 종목 조회 중..."):
+                df, status = fetch_designated_stocks(category)
+
+            if status != "ok":
+                st.error(f"조회 실패: {status}")
+                st.caption("네이버 금융 URL 구조가 바뀌었을 수 있습니다. "
+                           "상단 ▲ 아이콘의 'Manage app → View logs'에서 상세 로그 확인 가능.")
+                return
+
+            if df.empty:
+                st.info(f"현재 {category} 지정 종목이 없습니다.")
+                return
+
+            # 종목명 컬럼 찾기
+            name_col = None
+            for c in df.columns:
+                if "종목" in str(c) or "기업" in str(c):
+                    name_col = c
+                    break
+
+            st.markdown(f"**총 {len(df)}개 종목 지정 중** "
+                        f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # 관심종목 일괄 추가
+            if name_col and _github_config():
+                with st.expander("📥 이 리스트를 관심종목에 일괄 추가", expanded=False):
+                    st.caption("현재 지정 종목들을 관심종목 리스트에 한번에 추가합니다. "
+                               "이미 등록된 종목은 중복 추가되지 않습니다.")
+                    if st.button(f"➕ {category} 전체 추가",
+                                 key=f"add_all_{category}"):
+                        names = df[name_col].dropna().astype(str).tolist()
+                        result = add_to_watchlist(names)
+                        st.success(result) if "✅" in result else st.info(result)
+
+    render_designated("투자경고", sub1)
+    render_designated("투자위험", sub2)
+    render_designated("단기과열", sub3)
+
 
 st.markdown("---")
 st.caption("📌 공개 주가 데이터 기반 자체 계산입니다. "
-           "회전율은 거래량 비율로 근사 계산하며, 변동성은 (고-저)/전일종가 기준입니다. "
-           "최종 지정 여부는 한국거래소 공식 공시로 확인하세요.")
+           "현재 지정종목 리스트는 네이버 금융에서 실시간 반영됩니다. "
+           "최종 판단은 한국거래소 공식 공시로 확인하세요.")
