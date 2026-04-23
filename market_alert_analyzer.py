@@ -1,19 +1,18 @@
 """
-투경예고 / 단기과열예고 종목 조회기
+투경예고 / 단기과열예고 임계값 조회기
 ────────────────────────────────────────
-종목 하나를 입력하면 현재 해당 종목의
- - 투자경고 예고 해당 여부
- - 단기과열 예고 해당 여부
-를 계산해서 한눈에 보여줍니다.
+종목을 입력하면 예고 발동 임계값을 표로 보여줍니다.
+ - 각 조건의 기준값, 배수, 임계값(발동가), 현재가를 한눈에 비교
+ - 한 조건이라도 미충족이면 예고 미해당
 """
 import streamlit as st
 import pandas as pd
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 
-st.set_page_config(page_title="예고 상태 조회기", layout="centered")
-st.title("🔍 투경예고 / 단기과열예고 종목 조회")
-st.caption("종목을 입력하면 최근 주가 데이터로 예고 해당 여부를 즉시 판정합니다.")
+st.set_page_config(page_title="예고 임계값 조회기", layout="centered")
+st.title("🔍 투경예고 / 단기과열예고 임계값 조회")
+st.caption("종목을 입력하면 예고 발동 기준가(임계값)와 현재가를 비교해 보여줍니다.")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -46,51 +45,65 @@ def load_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
-# 예고 판정 로직
+# 임계값 계산
 # ─────────────────────────────────────────────────────────────
-def check_warning_alert(df: pd.DataFrame, idx: int) -> dict:
-    """투자경고 예고 판정 — 3대 요건 모두 충족 시 해당"""
+def build_warning_table(df: pd.DataFrame, idx: int, curr: int) -> pd.DataFrame | None:
+    """투자경고 3대 요건 표 생성"""
     if idx < 20:
-        return {"status": None, "reason": "데이터 부족(20거래일 미만)"}
+        return None
 
-    curr = int(df["종가"].iloc[idx])
     p5 = int(df["종가"].iloc[idx - 5])
     p20 = int(df["종가"].iloc[idx - 20])
     max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
 
-    c1 = curr >= int(p5 * 1.6)
-    c2 = curr >= int(p20 * 2.0)
-    c3 = curr >= max15
+    rows = [
+        {"조건": "① 5일 전 대비 60% 상승",
+         "기준값": f"{p5:,}원 (5일 전 종가)",
+         "배수": "× 1.60",
+         "임계값(발동가)": p5 * 1.6,
+         "현재가": curr,
+         "충족": curr >= p5 * 1.6},
+        {"조건": "② 20일 전 대비 100% 상승",
+         "기준값": f"{p20:,}원 (20일 전 종가)",
+         "배수": "× 2.00",
+         "임계값(발동가)": p20 * 2.0,
+         "현재가": curr,
+         "충족": curr >= p20 * 2.0},
+        {"조건": "③ 15거래일 중 최고가",
+         "기준값": f"{max15:,}원 (15일 최고가)",
+         "배수": "× 1.00",
+         "임계값(발동가)": max15,
+         "현재가": curr,
+         "충족": curr >= max15},
+    ]
+    return pd.DataFrame(rows)
 
-    return {
-        "status": all([c1, c2, c3]),
-        "current": curr,
-        "criteria": [
-            {"label": "5일 전 대비 60% 상승",
-             "base": p5, "threshold": int(p5 * 1.6), "pass": c1},
-            {"label": "20일 전 대비 100% 상승",
-             "base": p20, "threshold": int(p20 * 2.0), "pass": c2},
-            {"label": "15거래일 중 최고가",
-             "base": max15, "threshold": max15, "pass": c3},
-        ],
-    }
 
-
-def check_overheat_alert(df: pd.DataFrame, idx: int) -> dict:
-    """단기과열 예고 판정 — 주가 요건 (거래회전율·변동성은 별도)"""
+def build_overheat_table(df: pd.DataFrame, idx: int, curr: int) -> pd.DataFrame | None:
+    """단기과열 주가요건 표 생성"""
     if idx < 39:
-        return {"status": None, "reason": "데이터 부족(40거래일 미만)"}
+        return None
 
-    curr = int(df["종가"].iloc[idx])
     avg40 = df["종가"].iloc[idx - 39: idx + 1].mean()
-    threshold = int(avg40 * 1.3)
 
-    return {
-        "status": curr >= threshold,
-        "current": curr,
-        "avg40": int(avg40),
-        "threshold": threshold,
-    }
+    rows = [
+        {"조건": "주가요건 (40일 평균 대비 130%)",
+         "기준값": f"{int(avg40):,}원 (40일 평균 종가)",
+         "배수": "× 1.30",
+         "임계값(발동가)": avg40 * 1.3,
+         "현재가": curr,
+         "충족": curr >= avg40 * 1.3},
+    ]
+    return pd.DataFrame(rows)
+
+
+def format_table(df: pd.DataFrame) -> pd.DataFrame:
+    """표 숫자 포맷팅"""
+    d = df.copy()
+    d["임계값(발동가)"] = d["임계값(발동가)"].apply(lambda v: f"{int(v):,}원")
+    d["현재가"] = d["현재가"].apply(lambda v: f"{int(v):,}원")
+    d["충족"] = d["충족"].apply(lambda v: "✅" if v else "❌")
+    return d
 
 
 # ─────────────────────────────────────────────────────────────
@@ -115,7 +128,6 @@ if not ticker:
     st.stop()
 
 name = name_map[ticker]
-
 end = datetime.now().strftime("%Y-%m-%d")
 start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
 
@@ -129,7 +141,6 @@ if df.empty:
     st.error("주가 데이터가 비어 있습니다.")
     st.stop()
 
-# 기준일 선택
 date_list = df.index.strftime("%Y-%m-%d").tolist()[::-1]
 selected_date = st.selectbox("📅 기준일", date_list, index=0,
                               help="기본값은 가장 최근 거래일입니다.")
@@ -138,64 +149,61 @@ base_idx = df.index.get_loc(pd.Timestamp(selected_date))
 if isinstance(base_idx, slice):
     base_idx = base_idx.stop - 1
 
+curr_p = int(df["종가"].iloc[base_idx])
+
 # ═══════════════════════════════════════════════════════════
-# 결과 표시 — 한눈에 보이게
+# 헤더
 # ═══════════════════════════════════════════════════════════
 st.markdown(f"### 📍 {name} ({ticker})")
-curr_p = int(df["종가"].iloc[base_idx])
-st.markdown(f"**{selected_date} 종가:** {curr_p:,}원")
+st.markdown(f"**{selected_date} 종가:** <span style='font-size:24px;color:#d35400'>"
+            f"{curr_p:,}원</span>", unsafe_allow_html=True)
 
 st.markdown("---")
 
-warn = check_warning_alert(df, base_idx)
-overheat = check_overheat_alert(df, base_idx)
+# ═══════════════════════════════════════════════════════════
+# 투자경고 예고
+# ═══════════════════════════════════════════════════════════
+st.markdown("### ⚠️ 투자경고 예고")
 
-col1, col2 = st.columns(2)
-
-with col1:
-    st.markdown("#### ⚠️ 투자경고 예고")
-    if warn["status"] is None:
-        st.info(warn["reason"])
-    elif warn["status"]:
-        st.error("🔴 **예고 해당**\n\n3대 요건 모두 충족")
+warn_df = build_warning_table(df, base_idx, curr_p)
+if warn_df is None:
+    st.info("데이터 부족(20거래일 미만)")
+else:
+    all_pass = warn_df["충족"].all()
+    if all_pass:
+        st.error("🔴 **예고 해당** — 3대 요건 모두 충족")
     else:
-        n_pass = sum(1 for c in warn["criteria"] if c["pass"])
-        st.success(f"🟢 **미해당**\n\n충족 요건: {n_pass} / 3")
+        n_pass = int(warn_df["충족"].sum())
+        st.success(f"🟢 **미해당** — 충족 요건: {n_pass} / 3")
 
-with col2:
-    st.markdown("#### 🔥 단기과열 예고")
-    if overheat["status"] is None:
-        st.info(overheat["reason"])
-    elif overheat["status"]:
-        st.error("🔴 **주가요건 충족**\n\n(회전율·변동성 별도 확인 필요)")
-    else:
-        diff = overheat["threshold"] - overheat["current"]
-        st.success(f"🟢 **미해당**\n\n기준가까지 {diff:,}원 남음")
+    st.dataframe(format_table(warn_df), use_container_width=True,
+                 hide_index=True)
+    st.caption("※ 3개 요건 **모두** 충족 시 예고 해당. "
+               "특수 지정예고(초단기·중기 등)는 별도 KRX 공시 확인 필요.")
 
 st.markdown("---")
 
-# 상세 내역
-with st.expander("📋 투자경고 예고 상세 요건", expanded=False):
-    if warn["status"] is None:
-        st.info(warn["reason"])
-    else:
-        for c in warn["criteria"]:
-            mark = "✅" if c["pass"] else "❌"
-            st.write(f"{mark} **{c['label']}**  "
-                     f"기준가 {c['threshold']:,}원 vs 현재가 {curr_p:,}원")
-        st.caption("※ 3개 요건 모두 충족 시 '예고 해당'으로 판정. "
-                   "특수 지정예고(초단기·중기 등)는 별도 KRX 공시 확인 필요.")
+# ═══════════════════════════════════════════════════════════
+# 단기과열 예고
+# ═══════════════════════════════════════════════════════════
+st.markdown("### 🔥 단기과열 예고 (주가요건)")
 
-with st.expander("📋 단기과열 예고 상세 요건", expanded=False):
-    if overheat["status"] is None:
-        st.info(overheat["reason"])
+oh_df = build_overheat_table(df, base_idx, curr_p)
+if oh_df is None:
+    st.info("데이터 부족(40거래일 미만)")
+else:
+    if bool(oh_df["충족"].iloc[0]):
+        st.error("🔴 **주가요건 충족** — 회전율·변동성 별도 확인 필요")
     else:
-        st.write(f"- 40거래일 평균 종가: **{overheat['avg40']:,}원**")
-        st.write(f"- 지정 기준가(평균×130%): **{overheat['threshold']:,}원**")
-        st.write(f"- 현재 종가: **{overheat['current']:,}원**")
-        st.caption("※ 단기과열은 주가 요건 외에 거래회전율·변동성 요건이 "
-                   "모두 충족되어야 실제 예고 지정. 주가만으로는 부분 판정입니다.")
+        threshold = int(oh_df["임계값(발동가)"].iloc[0])
+        gap = threshold - curr_p
+        st.success(f"🟢 **미해당** — 임계값까지 {gap:,}원 남음")
+
+    st.dataframe(format_table(oh_df), use_container_width=True,
+                 hide_index=True)
+    st.caption("※ 단기과열은 주가 요건 외에 거래회전율·변동성 요건이 "
+               "모두 충족되어야 실제 예고 지정. 본 표는 **주가 요건만** 판정합니다.")
 
 st.markdown("---")
-st.caption("📌 본 도구는 공개 주가 데이터로 요건을 자체 계산합니다. "
+st.caption("📌 본 도구는 공개 주가 데이터로 요건을 자체 계산한 참고용입니다. "
            "최종 지정 여부는 한국거래소 공식 공시를 확인하세요.")
