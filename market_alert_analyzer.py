@@ -1,9 +1,10 @@
 """
-투경예고 / 단기과열예고 임계값 조회기 + 관심종목 대시보드 + 현재 지정종목
+투경예고 / 단기과열예고 임계값 조회기 + 관심종목 대시보드 + 현재 지정종목 + CB/BW 조회
 ────────────────────────────────────────────────────────────────────
  [1] 개별 종목 조회 (차트 포함)
  [2] 관심종목 대시보드 (GitHub 저장 + 근접 경고)
  [3] 현재 지정종목 (네이버 금융 실시간 반영, 지정해제 시 자동 제외)
+ [4] CB/BW 조회 (DART OpenAPI, 하이브리드: 발행=실시간 / 잔액=분기)
 """
 import streamlit as st
 import pandas as pd
@@ -13,6 +14,12 @@ import altair as alt
 import FinanceDataReader as fdr
 from datetime import datetime, timedelta
 from io import StringIO
+
+try:
+    import OpenDartReader
+    _HAS_DART = True
+except Exception:
+    _HAS_DART = False
 
 st.set_page_config(page_title="예고 임계값 조회기", layout="wide")
 st.title("🔍 투경예고 / 단기과열예고 조회")
@@ -81,7 +88,7 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     s = str(designated_date_str).strip()
     current_year = datetime.now().year
 
-    for fmt in ["%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%Y%m%d"]:
+    for fmt in ["%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
         try:
             dt = pd.to_datetime(s, format=fmt)
             break
@@ -92,8 +99,7 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     if dt is None:
         for fmt in ["%m.%d", "%m-%d", "%m/%d"]:
             try:
-                normalized = s.replace('-', '.').replace('/', '.')
-                dt = pd.to_datetime(f"{current_year}.{normalized}",
+                dt = pd.to_datetime(f"{current_year}.{s.replace('-', '.').replace('/', '.')}",
                                     format="%Y.%m.%d")
                 break
             except Exception:
@@ -107,111 +113,6 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     release_dt = dt + pd.offsets.BDay(days)
 
     return release_dt.strftime("%Y-%m-%d")
-
-
-def _parse_naver_date(s: str) -> str | None:
-    """네이버의 다양한 날짜 포맷을 YYYY-MM-DD로 정규화"""
-    s = str(s).strip()
-    if not s or s in ("nan", "None"):
-        return None
-
-    # YY.MM.DD 또는 YYYY.MM.DD
-    for fmt in ["%Y.%m.%d", "%y.%m.%d", "%Y-%m-%d", "%y-%m-%d",
-                "%Y/%m/%d", "%y/%m/%d"]:
-        try:
-            dt = pd.to_datetime(s, format=fmt)
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            continue
-
-    # 시간 붙은 경우 ("2026.04.22 16:30" 등) 날짜만 추출 후 재시도
-    import re
-    m = re.match(r"(\d{2,4})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
-    if m:
-        y, mo, d = m.groups()
-        if len(y) == 2:
-            y = "20" + y
-        try:
-            dt = pd.to_datetime(f"{y}-{mo}-{d}")
-            return dt.strftime("%Y-%m-%d")
-        except Exception:
-            pass
-    return None
-
-
-@st.cache_data(ttl=1800)
-def fetch_designation_date(code: str, category: str) -> tuple[str | None, str]:
-    """
-    네이버 개별 종목 공시 페이지에서 지정일 파싱.
-    반환: (YYYY-MM-DD 또는 None, 상태메시지)
-    """
-    keyword_map = {
-        "단기과열": "단기과열",
-        "투자경고": "투자경고",
-        "투자위험": "투자위험",
-    }
-    keyword = keyword_map.get(category)
-    if not keyword:
-        return None, "unknown_category"
-
-    urls = [
-        f"https://finance.naver.com/item/news_notice.naver?code={code}&page=1",
-        f"https://finance.naver.com/item/news_notice.nhn?code={code}&page=1",
-    ]
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/120.0 Safari/537.36"),
-        "Referer": "https://finance.naver.com/",
-    }
-
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=8)
-            if r.status_code != 200:
-                continue
-            html = r.content.decode("euc-kr", errors="replace")
-            tables = pd.read_html(StringIO(html))
-        except Exception:
-            continue
-
-        for table in tables:
-            if len(table) == 0:
-                continue
-            # 제목/날짜 컬럼 탐지
-            title_col = None
-            date_col = None
-            for col in table.columns:
-                col_str = str(col)
-                if "제목" in col_str:
-                    title_col = col
-                elif "날짜" in col_str or "일시" in col_str or "일자" in col_str:
-                    date_col = col
-
-            if title_col is None:
-                continue
-
-            for _, row in table.iterrows():
-                title = str(row.get(title_col, ""))
-                if not title or title == "nan":
-                    continue
-                # 카테고리 키워드 + '지정' 포함, 단 '예고'/'해제'는 제외
-                if keyword not in title:
-                    continue
-                if "지정" not in title:
-                    continue
-                if "예고" in title or "해제" in title:
-                    continue
-                # 지정일 추출
-                if date_col:
-                    date_raw = row.get(date_col, "")
-                    parsed = _parse_naver_date(str(date_raw))
-                    if parsed:
-                        return parsed, "ok"
-        # 표는 찾았지만 매칭되는 공시가 없음 → 다음 URL 시도 안 하고 바로 종료
-        return None, "no_match"
-
-    return None, "fetch_failed"
 
 
 @st.cache_data(ttl=600)
@@ -339,8 +240,142 @@ def add_to_watchlist(stock_names: list) -> str:
 
 
 # ─────────────────────────────────────────────────────────────
-# 이상상태 & 예고 판정
+# DART OpenAPI (CB/BW 조회)
 # ─────────────────────────────────────────────────────────────
+@st.cache_resource
+def get_dart_client():
+    """DART API 클라이언트. secrets에 DART_API_KEY 없으면 None"""
+    if not _HAS_DART:
+        return None
+    try:
+        api_key = st.secrets["DART_API_KEY"]
+        return OpenDartReader.OpenDartReader(api_key)
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600)
+def fetch_cb_bw_disclosures(ticker: str, years_back: int = 5) -> pd.DataFrame:
+    """
+    최근 N년간 해당 종목의 CB/BW 발행결정 공시 목록 조회.
+    kind='B' (주요사항보고) 중에서 'CB 발행결정' / 'BW 발행결정' 필터링.
+    """
+    dart = get_dart_client()
+    if dart is None:
+        return pd.DataFrame()
+
+    end = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=365 * years_back)).strftime("%Y-%m-%d")
+
+    try:
+        df = dart.list(ticker, start=start, end=end, kind="B", final=True)
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None or len(df) == 0 or "report_nm" not in df.columns:
+        return pd.DataFrame()
+
+    # CB/BW 발행결정 공시만 추출
+    mask = df["report_nm"].str.contains(
+        "전환사채권\\s*발행결정|신주인수권부사채권\\s*발행결정",
+        na=False, regex=True
+    )
+    result = df[mask].copy().reset_index(drop=True)
+    if len(result) == 0:
+        return result
+
+    # 사채 종류 태그
+    result["사채종류"] = result["report_nm"].apply(
+        lambda s: "CB" if "전환사채" in str(s) else ("BW" if "신주인수권" in str(s) else "기타")
+    )
+    # DART 원문 URL
+    result["원문URL"] = result["rcept_no"].apply(
+        lambda rn: f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={rn}"
+    )
+    return result
+
+
+@st.cache_data(ttl=3600)
+def fetch_debt_securities_latest(ticker: str) -> tuple[pd.DataFrame, str]:
+    """
+    가장 최근 정기보고서(분기/반기/사업)의 '채무증권 발행실적' 조회.
+    반환: (DataFrame, 보고서설명). 실패 시 (빈 DF, 에러메시지)
+    """
+    dart = get_dart_client()
+    if dart is None:
+        return pd.DataFrame(), "DART API 미설정"
+
+    current_year = datetime.now().year
+    # 최신 → 과거 순으로 시도. reprt_code: 사업(11011), 반기(11012), 1분기(11013), 3분기(11014)
+    # 최근 것부터: 이번 연도 3분기 → 반기 → 1분기 → 전년도 사업 → 전년도 3분기 ...
+    attempts = []
+    for year in [current_year, current_year - 1, current_year - 2]:
+        for code, label in [("11014", "3분기"), ("11012", "반기"),
+                             ("11013", "1분기"), ("11011", "사업")]:
+            attempts.append((year, code, label))
+
+    last_err = ""
+    for year, code, label in attempts:
+        try:
+            df = dart.report(ticker, "채무증권발행", year, reprt_code=code)
+            if df is not None and len(df) > 0:
+                return df.copy(), f"{year}년 {label}보고서"
+        except Exception as e:
+            last_err = str(e)[:80]
+            continue
+
+    return pd.DataFrame(), f"최근 3년 정기보고서에 채무증권 발행실적 없음 ({last_err})"
+
+
+def filter_cb_bw_outstanding(df_debt: pd.DataFrame) -> pd.DataFrame:
+    """
+    채무증권 발행실적 DF에서 CB/BW 중 '미상환 잔액이 있는 것'만 필터.
+    DART 응답 컬럼명이 버전에 따라 조금씩 다를 수 있어 방어적으로 탐색.
+    """
+    if df_debt is None or len(df_debt) == 0:
+        return pd.DataFrame()
+
+    # 증권종류명 컬럼 찾기
+    kind_col = None
+    for c in df_debt.columns:
+        if "isu_nm" in str(c).lower() or "종류" in str(c) or "scrits_knd" in str(c).lower():
+            kind_col = c
+            break
+    if kind_col is None:
+        # fallback: 모든 행 포함
+        result = df_debt.copy()
+    else:
+        mask = df_debt[kind_col].astype(str).str.contains(
+            "전환사채|신주인수권부사채|CB|BW|전환|신주인수권",
+            na=False, regex=True
+        )
+        result = df_debt[mask].copy()
+
+    # 미상환 잔액 컬럼 찾기
+    remain_col = None
+    for c in result.columns:
+        cl = str(c).lower()
+        if "remndr" in cl or "미상환" in str(c) or "잔액" in str(c):
+            remain_col = c
+            break
+
+    if remain_col is not None:
+        def _to_num(x):
+            try:
+                s = str(x).replace(",", "").replace("원", "").strip()
+                if s in ("", "-", "—", "nan"):
+                    return 0
+                return float(s)
+            except Exception:
+                return 0
+        result["_잔액숫자"] = result[remain_col].apply(_to_num)
+        result = result[result["_잔액숫자"] > 0].copy()
+        result = result.drop(columns=["_잔액숫자"])
+
+    return result.reset_index(drop=True)
+
+
+
 def detect_anomaly(df):
     if df.empty:
         return {"anomaly": True, "reason": "데이터 없음"}
@@ -417,29 +452,6 @@ def evaluate_overheat(df, idx):
     }
 
 
-def detect_predesignation_history(df, base_idx, evaluator_func, lookback=10):
-    """
-    기준일 이전 lookback 거래일 동안 예고 조건 충족 이력을 확인.
-    반환:
-    - is_predesignated: 현재 예고 상태인지
-    - trigger_date: 첫 예고 발동일 (YYYY-MM-DD)
-    - days_remaining: 지정 유예기간 남은 거래일수 (최대 10)
-    """
-    start_idx = max(0, base_idx - lookback)
-    for i in range(start_idx, base_idx):  # base_idx 자신(오늘)은 제외
-        try:
-            ev = evaluator_func(df, i)
-            if ev.get("status"):
-                trigger_idx = i
-                trigger_date = df.index[i].strftime("%Y-%m-%d")
-                days_elapsed = base_idx - trigger_idx
-                days_remaining = lookback - days_elapsed
-                return True, trigger_date, days_remaining
-        except Exception:
-            continue
-    return False, None, None
-
-
 def status_label(ev):
     if ev.get("status") is None:
         return "—", 99
@@ -514,10 +526,11 @@ except Exception as e:
 # ═══════════════════════════════════════════════════════════
 # 탭 3개
 # ═══════════════════════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 개별 종목 조회",
     "📋 관심종목 대시보드",
     "📌 현재 지정종목",
+    "🏦 CB/BW 조회",
 ])
 
 # ───────────────────────────────────────────────────────────
@@ -564,12 +577,6 @@ with tab1:
                 oh_ev = evaluate_overheat(df, base_idx)
                 curr_p = int(df["종가"].iloc[base_idx])
 
-                # 최근 10거래일 예고 이력 스캔 → 현재 '예고 중' 여부
-                warn_pre, warn_trigger, warn_days_left = \
-                    detect_predesignation_history(df, base_idx, evaluate_warning)
-                oh_pre, oh_trigger, oh_days_left = \
-                    detect_predesignation_history(df, base_idx, evaluate_overheat)
-
                 st.markdown(f"### 📍 {name} ({ticker})")
                 st.markdown(f"**{selected_date} 종가:** "
                             f"<span style='font-size:22px;color:#d35400'>"
@@ -578,78 +585,36 @@ with tab1:
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown("#### ⚠️ 투자경고")
-
-                    # 현재 예고 상태 설명
-                    if warn_pre:
-                        st.warning(
-                            f"🟠 **예고 상태 지속 중** — "
-                            f"예고 발동일 추정: {warn_trigger} "
-                            f"(지정까지 {warn_days_left}거래일 남음)"
-                        )
-                        table_label = "**🎯 지정 임계값** (예고 상태 → 재충족 시 지정 발동)"
-                    else:
-                        st.info("🔵 최근 10거래일 내 예고 이력 없음 → "
-                                "오늘 충족 시 **예고** 발동")
-                        table_label = "**💡 예고 임계값** (충족 시 예고 발동)"
-
-                    # 오늘 판정
+                    st.markdown("#### ⚠️ 투자경고 예고")
                     if warn_ev["status"] is None:
                         st.info(warn_ev["reason"])
                     else:
                         label, _ = status_label(warn_ev)
                         if warn_ev["status"]:
-                            if warn_pre:
-                                st.error(f"🚨 {label} — **지정 발동!** 3요건 재충족")
-                            else:
-                                st.error(f"🔴 {label} — 3요건 모두 충족 → 예고 발동")
+                            st.error(f"{label} — 3대 요건 모두 충족")
                         elif "근접" in label:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
-
                     if warn_ev.get("criteria"):
-                        st.markdown(table_label)
                         st.dataframe(fmt_warning_table(warn_ev),
                                      use_container_width=True, hide_index=True)
 
                 with c2:
-                    st.markdown("#### 🔥 단기과열")
-
-                    if oh_pre:
-                        st.warning(
-                            f"🟠 **예고 상태 지속 중** — "
-                            f"예고 발동일 추정: {oh_trigger} "
-                            f"(지정까지 {oh_days_left}거래일 남음)"
-                        )
-                        table_label = "**🎯 지정 임계값** (예고 상태 → 재충족 시 지정 발동)"
-                    else:
-                        st.info("🔵 최근 10거래일 내 예고 이력 없음 → "
-                                "오늘 충족 시 **예고** 발동")
-                        table_label = "**💡 예고 임계값** (충족 시 예고 발동)"
-
+                    st.markdown("#### 🔥 단기과열 예고")
                     if oh_ev["status"] is None:
                         st.info(oh_ev["reason"])
                     else:
                         label, _ = status_label(oh_ev)
                         if oh_ev["status"]:
-                            if oh_pre:
-                                st.error(f"🚨 {label} — **지정 발동!** 3요건 재충족")
-                            else:
-                                st.error(f"🔴 {label} — 3요건 모두 충족 → 예고 발동")
+                            st.error(f"{label} — 3대 요건 모두 충족")
                         elif "근접" in label:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
-
                     if oh_ev.get("criteria"):
-                        st.markdown(table_label)
                         st.dataframe(fmt_overheat_table(oh_ev),
                                      use_container_width=True, hide_index=True)
-
-                st.caption("💡 예고 ↔ 지정 임계값은 **수치상 동일**합니다. "
-                           "다만 이미 예고된 상태에서 재충족하면 '지정'으로, "
-                           "예고 이력 없을 때 충족하면 '예고'로 발동됩니다.")
 
                 st.markdown("---")
                 st.markdown("#### 📈 최근 60일 종가 + 임계값")
@@ -802,7 +767,8 @@ with tab3:
 
             if status != "ok":
                 st.error(f"조회 실패: {status}")
-                st.caption("네이버 금융 URL 구조가 바뀌었을 수 있습니다.")
+                st.caption("네이버 금융 URL 구조가 바뀌었을 수 있습니다. "
+                           "상단 ▲ 아이콘의 'Manage app → View logs'에서 상세 로그 확인 가능.")
                 return
 
             if df.empty:
@@ -816,78 +782,38 @@ with tab3:
                     name_col = c
                     break
 
-            df = df.copy()
-            reverse_map = {v: k for k, v in name_map.items()}
+            # 지정일 컬럼 찾기 → 해제 판단일 계산 후 맨 뒤에 추가
+            designated_col = None
+            for c in df.columns:
+                if "지정일" in str(c):
+                    designated_col = c
+                    break
 
-            # ─── 자동 지정일 파싱 ───
-            auto_dates = []
-            auto_release = []
-            auto_status = []
-
-            if name_col:
-                progress = st.progress(0, text="지정일 자동 조회 중...")
-                for i, name in enumerate(df[name_col]):
-                    progress.progress((i + 1) / len(df),
-                                       text=f"지정일 조회 중... ({i+1}/{len(df)}) {name}")
-                    code = reverse_map.get(str(name).strip())
-                    if code:
-                        date, st_msg = fetch_designation_date(code, category)
-                    else:
-                        date, st_msg = None, "no_code"
-                    auto_dates.append(date if date else "—")
-                    auto_release.append(
-                        calculate_release_date(category, date) if date else "—"
-                    )
-                    auto_status.append(st_msg)
-                progress.empty()
-
-            df["지정일(자동)"] = auto_dates
+            # 컬럼 제목
             release_col_name = ("해제 예정일" if category == "단기과열"
                                 else "해제 평가 시작일")
-            df[release_col_name] = auto_release
 
-            # 종목별 네이버 링크 컬럼 (클릭 시 공시 확인 가능)
-            if name_col:
-                def make_link(name):
-                    code = reverse_map.get(str(name).strip())
-                    if not code:
-                        return ""
-                    return f"https://finance.naver.com/item/news_notice.naver?code={code}"
-                df["공시(네이버)"] = df[name_col].apply(make_link)
-
-            # ─── 요약 ───
-            ok_count = sum(1 for s in auto_status if s == "ok")
-            total = len(df)
-            st.markdown(f"**총 {total}개 종목 지정 중** "
-                        f"(기준: {datetime.now():%Y-%m-%d %H:%M}) | "
-                        f"자동 파싱 성공: {ok_count}/{total}")
-
-            try:
-                st.dataframe(
-                    df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "공시(네이버)": st.column_config.LinkColumn(
-                            "공시(네이버)",
-                            display_text="🔗 열기",
-                            help="네이버 개별 종목 공시 페이지 (지정일 수동 확인용)",
-                        ),
-                    },
+            if designated_col:
+                df = df.copy()
+                df[release_col_name] = df[designated_col].apply(
+                    lambda d: calculate_release_date(category, str(d))
                 )
-            except Exception:
-                st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                df = df.copy()
+                df[release_col_name] = "—"
 
-            # 안내
+            st.markdown(f"**총 {len(df)}개 종목 지정 중** "
+                        f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # 해제 판단일 설명
             if category == "단기과열":
                 st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
-                           "지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장 가능.")
+                           "단, 지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장될 수 있음.")
             else:
                 st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
                            "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
-            st.caption("※ 지정일은 네이버 공시 페이지에서 자동 파싱한 값입니다. "
-                       "'—' 표시는 자동 조회 실패 — '🔗 열기'로 공시 확인 후 "
-                       "아래 '수동 계산기'에서 직접 입력하세요.")
+            st.caption("※ 공휴일은 반영되지 않아 실제 날짜와 ±1~2일 차이날 수 있습니다.")
 
             # 관심종목 일괄 추가
             if name_col and _github_config():
@@ -904,46 +830,121 @@ with tab3:
     render_designated("투자위험", sub2)
     render_designated("단기과열", sub3)
 
-    # ─────────────────────────────────────────────────
-    # 수동 지정일 → 해제일 계산기
-    # ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.markdown("### 🔧 수동 지정일 계산기")
-    st.caption("위 표에 지정일이 '—'로 나오거나, 특정 종목의 해제일만 빠르게 계산하고 싶을 때 사용하세요.")
 
-    mc1, mc2, mc3 = st.columns([2, 2, 3])
-    with mc1:
-        manual_category = st.selectbox(
-            "카테고리",
-            ["단기과열", "투자경고", "투자위험"],
-            key="manual_calc_category",
-        )
-    with mc2:
-        manual_date = st.date_input(
-            "지정일",
-            value=datetime.now().date(),
-            key="manual_calc_date",
-            help="해당 종목의 지정 공시 날짜 (YYYY-MM-DD)",
-        )
-    with mc3:
-        manual_date_str = manual_date.strftime("%Y-%m-%d")
-        release_str = calculate_release_date(manual_category, manual_date_str)
-        label = ("해제 예정일 (확정)" if manual_category == "단기과열"
-                 else "해제 평가 시작일 (조건부)")
-        st.markdown("**계산 결과**")
-        st.markdown(f"{label}: "
-                    f"<span style='font-size:20px;color:#2980b9'>"
-                    f"**{release_str}**</span>", unsafe_allow_html=True)
+# ───────────────────────────────────────────────────────────
+# 탭 4: CB/BW 조회 (DART OpenAPI)
+# ───────────────────────────────────────────────────────────
+with tab4:
+    st.caption("DART 전자공시 기반 CB(전환사채) / BW(신주인수권부사채) 조회. "
+               "**발행 공시는 실시간**, **미상환 잔액은 가장 최근 정기보고서 기준(분기 단위)**입니다.")
 
-    if manual_category == "단기과열":
-        st.caption("🟦 단기과열은 지정일 + 3거래일이 지나면 자동 해제됩니다 (연장 조건 제외).")
-    else:
-        st.caption(f"🟦 {manual_category}은 지정일 + 10거래일 이후부터 해제 평가를 받을 수 있습니다. "
-                   "실제 해제는 주가 조건 충족 시점.")
-    st.caption("※ 공휴일 미반영으로 실제 날짜와 ±1~2일 차이날 수 있습니다.")
+    # DART 클라이언트 상태 체크
+    dart_client = get_dart_client()
+    if not _HAS_DART:
+        st.error("❌ OpenDartReader 라이브러리가 설치되지 않았습니다. "
+                 "`requirements.txt`에 `OpenDartReader>=0.2.1`을 추가하고 재배포하세요.")
+        st.stop()
+    if dart_client is None:
+        st.error("❌ DART API 키가 설정되지 않았습니다. "
+                 "Streamlit Secrets에 `DART_API_KEY = \"...\"` 형태로 추가하세요. "
+                 "키 발급: https://opendart.fss.or.kr/")
+        st.stop()
+
+    # 종목 입력
+    col_in, col_yrs = st.columns([2, 1])
+    with col_in:
+        cb_input = st.text_input("종목코드 6자리 또는 종목명",
+                                  value="", key="cb_input",
+                                  placeholder="예: 삼성전자 또는 005930")
+    with col_yrs:
+        years_back = st.selectbox("발행 공시 조회 기간", [3, 5, 7, 10],
+                                   index=1, key="cb_years")
+
+    if cb_input.strip():
+        ticker = resolve_ticker(cb_input, name_map)
+        if not ticker:
+            st.error("종목을 찾지 못했습니다.")
+        else:
+            name = name_map[ticker]
+            st.markdown(f"### 📍 {name} ({ticker})")
+
+            # ─── 섹션 1: 발행 공시 이력 ───
+            with st.spinner("DART 발행공시 조회 중..."):
+                df_disc = fetch_cb_bw_disclosures(ticker, years_back)
+
+            st.markdown(f"#### 📋 최근 {years_back}년 CB/BW 발행 공시")
+            if df_disc.empty:
+                st.info(f"최근 {years_back}년 내 CB/BW 발행 공시 없음.")
+            else:
+                # 주요 컬럼만 표시
+                show_cols = []
+                for c in ["rcept_dt", "report_nm", "사채종류", "rcept_no"]:
+                    if c in df_disc.columns:
+                        show_cols.append(c)
+                rename_map = {
+                    "rcept_dt": "접수일",
+                    "report_nm": "공시명",
+                    "rcept_no": "접수번호",
+                }
+                df_show = df_disc[show_cols].rename(columns=rename_map)
+                st.caption(f"총 **{len(df_disc)}건** 발행 공시")
+                st.dataframe(df_show, use_container_width=True, hide_index=True)
+
+                # DART 원문 링크
+                with st.expander("🔗 DART 원문 바로가기", expanded=False):
+                    for _, row in df_disc.iterrows():
+                        rd = row.get("rcept_dt", "—")
+                        rn = row.get("report_nm", "—")
+                        url = row.get("원문URL", "#")
+                        st.markdown(f"- [{rd}] {rn} → [DART 원문]({url})")
+
+            st.markdown("---")
+
+            # ─── 섹션 2: 미상환 잔액 (최근 정기보고서) ───
+            st.markdown("#### 💰 현재 미상환 CB/BW 잔액")
+            with st.spinner("최근 정기보고서 조회 중..."):
+                df_debt, report_label = fetch_debt_securities_latest(ticker)
+
+            if df_debt.empty:
+                st.info(f"ℹ️ {report_label}")
+                st.caption("정기보고서에 '채무증권 발행실적' 항목이 없거나, "
+                           "해당 종목이 CB/BW를 발행한 적 없을 수 있습니다.")
+            else:
+                df_outstanding = filter_cb_bw_outstanding(df_debt)
+
+                if df_outstanding.empty:
+                    st.success(f"✅ **미상환 CB/BW 없음** (기준: {report_label})")
+                    with st.expander("전체 채무증권 발행실적 보기 (참고)", expanded=False):
+                        st.dataframe(df_debt, use_container_width=True, hide_index=True)
+                else:
+                    st.warning(f"⚠️ **미상환 CB/BW {len(df_outstanding)}건** "
+                               f"(기준: {report_label})")
+                    st.dataframe(df_outstanding, use_container_width=True,
+                                 hide_index=True)
+
+                    st.caption(
+                        "💡 **잠재 출회주식수 계산법**: 미상환잔액 ÷ 현재 전환(행사)가액. "
+                        "정확한 계산은 표의 '미상환잔액'과 '전환가액'을 확인하세요. "
+                        "리픽싱은 이번 MVP에 미반영이지만, 정기보고서에는 기준일 시점의 "
+                        "조정된 전환가액이 이미 반영되어 있어 분기 말 기준으로는 정확합니다."
+                    )
+
+            # 주의사항
+            st.markdown("---")
+            with st.expander("ℹ️ 데이터 정확성 주의", expanded=False):
+                st.markdown(
+                    "- **발행 공시**: DART 주요사항보고서 기준, 실시간 반영\n"
+                    "- **미상환 잔액**: 최근 정기보고서(사업/반기/분기) 기준 — "
+                    "최대 약 3개월까지 낡은 숫자일 수 있음\n"
+                    "- **전환가액**: 정기보고서 기준일까지 반영된 리픽싱 결과. "
+                    "이후 발생한 리픽싱은 이번 MVP에서 추적하지 않음\n"
+                    "- **투자 판단 시** 반드시 DART 원문 공시와 최신 증권신고서·"
+                    "사업보고서를 교차 확인하세요."
+                )
 
 
 st.markdown("---")
-st.caption("📌 공개 주가 데이터 기반 자체 계산입니다. "
-           "현재 지정종목 리스트는 네이버 금융에서 실시간 반영됩니다. "
-           "최종 판단은 한국거래소 공식 공시로 확인하세요.")
+st.caption("📌 공개 데이터 기반 자체 계산입니다. "
+           "주가·예고는 FinanceDataReader, 지정종목은 네이버 금융, "
+           "CB/BW는 DART 전자공시 기반입니다. "
+           "최종 판단은 한국거래소 및 DART 공식 공시로 확인하세요.")
