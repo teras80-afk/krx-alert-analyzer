@@ -988,7 +988,32 @@ with tab3:
 
             st.markdown(f"**총 {len(df)}개 종목 지정 중** "
                         f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
-            st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # 핵심 3컬럼만 화이트리스트로 추리기
+            keep_cols = []
+            if name_col and name_col in df.columns:
+                keep_cols.append(name_col)
+            if designated_col and designated_col in df.columns:
+                keep_cols.append(designated_col)
+            if release_col_name in df.columns:
+                keep_cols.append(release_col_name)
+
+            if keep_cols:
+                df_simple = df[keep_cols].copy()
+                rename_map = {}
+                if name_col:
+                    rename_map[name_col] = "종목명"
+                if designated_col:
+                    rename_map[designated_col] = "지정일"
+                df_simple = df_simple.rename(columns=rename_map)
+                st.dataframe(df_simple, use_container_width=True, hide_index=True)
+
+                # 원본 전체 데이터는 접힌 expander로 제공 (필요 시 확인용)
+                with st.expander("🔍 원본 전체 컬럼 보기 (참고)", expanded=False):
+                    st.dataframe(df, use_container_width=True, hide_index=True)
+            else:
+                # fallback: 컬럼 못 찾으면 원본 그대로
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
             # 해제 판단일 설명
             if category == "단기과열":
