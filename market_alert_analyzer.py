@@ -81,7 +81,7 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     s = str(designated_date_str).strip()
     current_year = datetime.now().year
 
-    for fmt in ["%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+    for fmt in ["%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%Y%m%d"]:
         try:
             dt = pd.to_datetime(s, format=fmt)
             break
@@ -92,7 +92,8 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     if dt is None:
         for fmt in ["%m.%d", "%m-%d", "%m/%d"]:
             try:
-                dt = pd.to_datetime(f"{current_year}.{s.replace('-', '.').replace('/', '.')}",
+                normalized = s.replace('-', '.').replace('/', '.')
+                dt = pd.to_datetime(f"{current_year}.{normalized}",
                                     format="%Y.%m.%d")
                 break
             except Exception:
@@ -106,6 +107,111 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     release_dt = dt + pd.offsets.BDay(days)
 
     return release_dt.strftime("%Y-%m-%d")
+
+
+def _parse_naver_date(s: str) -> str | None:
+    """네이버의 다양한 날짜 포맷을 YYYY-MM-DD로 정규화"""
+    s = str(s).strip()
+    if not s or s in ("nan", "None"):
+        return None
+
+    # YY.MM.DD 또는 YYYY.MM.DD
+    for fmt in ["%Y.%m.%d", "%y.%m.%d", "%Y-%m-%d", "%y-%m-%d",
+                "%Y/%m/%d", "%y/%m/%d"]:
+        try:
+            dt = pd.to_datetime(s, format=fmt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+
+    # 시간 붙은 경우 ("2026.04.22 16:30" 등) 날짜만 추출 후 재시도
+    import re
+    m = re.match(r"(\d{2,4})[.\-/](\d{1,2})[.\-/](\d{1,2})", s)
+    if m:
+        y, mo, d = m.groups()
+        if len(y) == 2:
+            y = "20" + y
+        try:
+            dt = pd.to_datetime(f"{y}-{mo}-{d}")
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    return None
+
+
+@st.cache_data(ttl=1800)
+def fetch_designation_date(code: str, category: str) -> tuple[str | None, str]:
+    """
+    네이버 개별 종목 공시 페이지에서 지정일 파싱.
+    반환: (YYYY-MM-DD 또는 None, 상태메시지)
+    """
+    keyword_map = {
+        "단기과열": "단기과열",
+        "투자경고": "투자경고",
+        "투자위험": "투자위험",
+    }
+    keyword = keyword_map.get(category)
+    if not keyword:
+        return None, "unknown_category"
+
+    urls = [
+        f"https://finance.naver.com/item/news_notice.naver?code={code}&page=1",
+        f"https://finance.naver.com/item/news_notice.nhn?code={code}&page=1",
+    ]
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Referer": "https://finance.naver.com/",
+    }
+
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=8)
+            if r.status_code != 200:
+                continue
+            html = r.content.decode("euc-kr", errors="replace")
+            tables = pd.read_html(StringIO(html))
+        except Exception:
+            continue
+
+        for table in tables:
+            if len(table) == 0:
+                continue
+            # 제목/날짜 컬럼 탐지
+            title_col = None
+            date_col = None
+            for col in table.columns:
+                col_str = str(col)
+                if "제목" in col_str:
+                    title_col = col
+                elif "날짜" in col_str or "일시" in col_str or "일자" in col_str:
+                    date_col = col
+
+            if title_col is None:
+                continue
+
+            for _, row in table.iterrows():
+                title = str(row.get(title_col, ""))
+                if not title or title == "nan":
+                    continue
+                # 카테고리 키워드 + '지정' 포함, 단 '예고'/'해제'는 제외
+                if keyword not in title:
+                    continue
+                if "지정" not in title:
+                    continue
+                if "예고" in title or "해제" in title:
+                    continue
+                # 지정일 추출
+                if date_col:
+                    date_raw = row.get(date_col, "")
+                    parsed = _parse_naver_date(str(date_raw))
+                    if parsed:
+                        return parsed, "ok"
+        # 표는 찾았지만 매칭되는 공시가 없음 → 다음 URL 시도 안 하고 바로 종료
+        return None, "no_match"
+
+    return None, "fetch_failed"
 
 
 @st.cache_data(ttl=600)
@@ -311,6 +417,29 @@ def evaluate_overheat(df, idx):
     }
 
 
+def detect_predesignation_history(df, base_idx, evaluator_func, lookback=10):
+    """
+    기준일 이전 lookback 거래일 동안 예고 조건 충족 이력을 확인.
+    반환:
+    - is_predesignated: 현재 예고 상태인지
+    - trigger_date: 첫 예고 발동일 (YYYY-MM-DD)
+    - days_remaining: 지정 유예기간 남은 거래일수 (최대 10)
+    """
+    start_idx = max(0, base_idx - lookback)
+    for i in range(start_idx, base_idx):  # base_idx 자신(오늘)은 제외
+        try:
+            ev = evaluator_func(df, i)
+            if ev.get("status"):
+                trigger_idx = i
+                trigger_date = df.index[i].strftime("%Y-%m-%d")
+                days_elapsed = base_idx - trigger_idx
+                days_remaining = lookback - days_elapsed
+                return True, trigger_date, days_remaining
+        except Exception:
+            continue
+    return False, None, None
+
+
 def status_label(ev):
     if ev.get("status") is None:
         return "—", 99
@@ -435,6 +564,12 @@ with tab1:
                 oh_ev = evaluate_overheat(df, base_idx)
                 curr_p = int(df["종가"].iloc[base_idx])
 
+                # 최근 10거래일 예고 이력 스캔 → 현재 '예고 중' 여부
+                warn_pre, warn_trigger, warn_days_left = \
+                    detect_predesignation_history(df, base_idx, evaluate_warning)
+                oh_pre, oh_trigger, oh_days_left = \
+                    detect_predesignation_history(df, base_idx, evaluate_overheat)
+
                 st.markdown(f"### 📍 {name} ({ticker})")
                 st.markdown(f"**{selected_date} 종가:** "
                             f"<span style='font-size:22px;color:#d35400'>"
@@ -443,36 +578,78 @@ with tab1:
 
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.markdown("#### ⚠️ 투자경고 예고")
+                    st.markdown("#### ⚠️ 투자경고")
+
+                    # 현재 예고 상태 설명
+                    if warn_pre:
+                        st.warning(
+                            f"🟠 **예고 상태 지속 중** — "
+                            f"예고 발동일 추정: {warn_trigger} "
+                            f"(지정까지 {warn_days_left}거래일 남음)"
+                        )
+                        table_label = "**🎯 지정 임계값** (예고 상태 → 재충족 시 지정 발동)"
+                    else:
+                        st.info("🔵 최근 10거래일 내 예고 이력 없음 → "
+                                "오늘 충족 시 **예고** 발동")
+                        table_label = "**💡 예고 임계값** (충족 시 예고 발동)"
+
+                    # 오늘 판정
                     if warn_ev["status"] is None:
                         st.info(warn_ev["reason"])
                     else:
                         label, _ = status_label(warn_ev)
                         if warn_ev["status"]:
-                            st.error(f"{label} — 3대 요건 모두 충족")
+                            if warn_pre:
+                                st.error(f"🚨 {label} — **지정 발동!** 3요건 재충족")
+                            else:
+                                st.error(f"🔴 {label} — 3요건 모두 충족 → 예고 발동")
                         elif "근접" in label:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
+
                     if warn_ev.get("criteria"):
+                        st.markdown(table_label)
                         st.dataframe(fmt_warning_table(warn_ev),
                                      use_container_width=True, hide_index=True)
 
                 with c2:
-                    st.markdown("#### 🔥 단기과열 예고")
+                    st.markdown("#### 🔥 단기과열")
+
+                    if oh_pre:
+                        st.warning(
+                            f"🟠 **예고 상태 지속 중** — "
+                            f"예고 발동일 추정: {oh_trigger} "
+                            f"(지정까지 {oh_days_left}거래일 남음)"
+                        )
+                        table_label = "**🎯 지정 임계값** (예고 상태 → 재충족 시 지정 발동)"
+                    else:
+                        st.info("🔵 최근 10거래일 내 예고 이력 없음 → "
+                                "오늘 충족 시 **예고** 발동")
+                        table_label = "**💡 예고 임계값** (충족 시 예고 발동)"
+
                     if oh_ev["status"] is None:
                         st.info(oh_ev["reason"])
                     else:
                         label, _ = status_label(oh_ev)
                         if oh_ev["status"]:
-                            st.error(f"{label} — 3대 요건 모두 충족")
+                            if oh_pre:
+                                st.error(f"🚨 {label} — **지정 발동!** 3요건 재충족")
+                            else:
+                                st.error(f"🔴 {label} — 3요건 모두 충족 → 예고 발동")
                         elif "근접" in label:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
+
                     if oh_ev.get("criteria"):
+                        st.markdown(table_label)
                         st.dataframe(fmt_overheat_table(oh_ev),
                                      use_container_width=True, hide_index=True)
+
+                st.caption("💡 예고 ↔ 지정 임계값은 **수치상 동일**합니다. "
+                           "다만 이미 예고된 상태에서 재충족하면 '지정'으로, "
+                           "예고 이력 없을 때 충족하면 '예고'로 발동됩니다.")
 
                 st.markdown("---")
                 st.markdown("#### 📈 최근 60일 종가 + 임계값")
@@ -639,83 +816,78 @@ with tab3:
                     name_col = c
                     break
 
-            # 지정일 컬럼 찾기
-            designated_col = None
-            for c in df.columns:
-                if "지정일" in str(c):
-                    designated_col = c
-                    break
-
             df = df.copy()
-
-            # 지정일이 있으면 해제 판단일 계산, 없으면 종목별 네이버 링크로 대체
-            if designated_col:
-                release_col_name = ("해제 예정일" if category == "단기과열"
-                                    else "해제 평가 시작일")
-                df[release_col_name] = df[designated_col].apply(
-                    lambda d: calculate_release_date(category, str(d))
-                )
-
-            # 종목명 → 종목코드 매핑해서 네이버 링크 생성
-            # name_map은 {code: name} 이므로 역매핑 필요
             reverse_map = {v: k for k, v in name_map.items()}
 
+            # ─── 자동 지정일 파싱 ───
+            auto_dates = []
+            auto_release = []
+            auto_status = []
+
+            if name_col:
+                progress = st.progress(0, text="지정일 자동 조회 중...")
+                for i, name in enumerate(df[name_col]):
+                    progress.progress((i + 1) / len(df),
+                                       text=f"지정일 조회 중... ({i+1}/{len(df)}) {name}")
+                    code = reverse_map.get(str(name).strip())
+                    if code:
+                        date, st_msg = fetch_designation_date(code, category)
+                    else:
+                        date, st_msg = None, "no_code"
+                    auto_dates.append(date if date else "—")
+                    auto_release.append(
+                        calculate_release_date(category, date) if date else "—"
+                    )
+                    auto_status.append(st_msg)
+                progress.empty()
+
+            df["지정일(자동)"] = auto_dates
+            release_col_name = ("해제 예정일" if category == "단기과열"
+                                else "해제 평가 시작일")
+            df[release_col_name] = auto_release
+
+            # 종목별 네이버 링크 컬럼 (클릭 시 공시 확인 가능)
             if name_col:
                 def make_link(name):
                     code = reverse_map.get(str(name).strip())
                     if not code:
                         return ""
-                    return f"https://finance.naver.com/item/main.naver?code={code}"
-                df["상세(네이버)"] = df[name_col].apply(make_link)
+                    return f"https://finance.naver.com/item/news_notice.naver?code={code}"
+                df["공시(네이버)"] = df[name_col].apply(make_link)
 
-            # 요약 표시
-            if category == "단기과열" and not designated_col:
-                st.markdown(f"**총 {len(df)}개 종목 지정 중** "
-                            f"(기준: {datetime.now():%Y-%m-%d %H:%M}) | "
-                            f"⏱️ **전 종목 최대 3거래일 내 자동 해제 예정**")
-            else:
-                st.markdown(f"**총 {len(df)}개 종목 지정 중** "
-                            f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
+            # ─── 요약 ───
+            ok_count = sum(1 for s in auto_status if s == "ok")
+            total = len(df)
+            st.markdown(f"**총 {total}개 종목 지정 중** "
+                        f"(기준: {datetime.now():%Y-%m-%d %H:%M}) | "
+                        f"자동 파싱 성공: {ok_count}/{total}")
 
-            # 데이터프레임 + 링크 컬럼 설정
             try:
                 st.dataframe(
                     df,
                     use_container_width=True,
                     hide_index=True,
                     column_config={
-                        "상세(네이버)": st.column_config.LinkColumn(
-                            "상세(네이버)",
+                        "공시(네이버)": st.column_config.LinkColumn(
+                            "공시(네이버)",
                             display_text="🔗 열기",
-                            help="네이버 종목 페이지에서 지정일·공시 확인",
+                            help="네이버 개별 종목 공시 페이지 (지정일 수동 확인용)",
                         ),
                     },
                 )
             except Exception:
-                # 구버전 Streamlit 호환
                 st.dataframe(df, use_container_width=True, hide_index=True)
 
             # 안내
-            if not designated_col:
-                if category == "단기과열":
-                    st.caption("📅 네이버 페이지에 지정일 정보가 포함되어 있지 않아 "
-                               "정확한 해제일 자동 계산이 불가합니다. "
-                               "다만 **단기과열은 지정 후 3거래일 경과 시 자동 해제**이므로, "
-                               "이 리스트에 있는 종목은 **늦어도 3거래일 이내 해제 예정**입니다. "
-                               "정확한 지정일은 '🔗 열기' 클릭 → 네이버 종목 페이지에서 확인.")
-                else:
-                    st.caption("📅 네이버 페이지에 지정일 정보가 없어 해제 평가 시작일 "
-                               "자동 계산이 불가합니다. '🔗 열기' 클릭 → 네이버 종목 페이지에서 "
-                               "지정 관련 공시를 확인하세요. "
-                               f"({category}는 지정일 + 10거래일 경과 + 주가 조건 충족 시 해제)")
+            if category == "단기과열":
+                st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
+                           "지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장 가능.")
             else:
-                if category == "단기과열":
-                    st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
-                               "지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장 가능.")
-                else:
-                    st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
-                               "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
-                st.caption("※ 공휴일 미반영으로 실제 날짜와 ±1~2일 차이날 수 있음.")
+                st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
+                           "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
+            st.caption("※ 지정일은 네이버 공시 페이지에서 자동 파싱한 값입니다. "
+                       "'—' 표시는 자동 조회 실패 — '🔗 열기'로 공시 확인 후 "
+                       "아래 '수동 계산기'에서 직접 입력하세요.")
 
             # 관심종목 일괄 추가
             if name_col and _github_config():
@@ -731,6 +903,44 @@ with tab3:
     render_designated("투자경고", sub1)
     render_designated("투자위험", sub2)
     render_designated("단기과열", sub3)
+
+    # ─────────────────────────────────────────────────
+    # 수동 지정일 → 해제일 계산기
+    # ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🔧 수동 지정일 계산기")
+    st.caption("위 표에 지정일이 '—'로 나오거나, 특정 종목의 해제일만 빠르게 계산하고 싶을 때 사용하세요.")
+
+    mc1, mc2, mc3 = st.columns([2, 2, 3])
+    with mc1:
+        manual_category = st.selectbox(
+            "카테고리",
+            ["단기과열", "투자경고", "투자위험"],
+            key="manual_calc_category",
+        )
+    with mc2:
+        manual_date = st.date_input(
+            "지정일",
+            value=datetime.now().date(),
+            key="manual_calc_date",
+            help="해당 종목의 지정 공시 날짜 (YYYY-MM-DD)",
+        )
+    with mc3:
+        manual_date_str = manual_date.strftime("%Y-%m-%d")
+        release_str = calculate_release_date(manual_category, manual_date_str)
+        label = ("해제 예정일 (확정)" if manual_category == "단기과열"
+                 else "해제 평가 시작일 (조건부)")
+        st.markdown("**계산 결과**")
+        st.markdown(f"{label}: "
+                    f"<span style='font-size:20px;color:#2980b9'>"
+                    f"**{release_str}**</span>", unsafe_allow_html=True)
+
+    if manual_category == "단기과열":
+        st.caption("🟦 단기과열은 지정일 + 3거래일이 지나면 자동 해제됩니다 (연장 조건 제외).")
+    else:
+        st.caption(f"🟦 {manual_category}은 지정일 + 10거래일 이후부터 해제 평가를 받을 수 있습니다. "
+                   "실제 해제는 주가 조건 충족 시점.")
+    st.caption("※ 공휴일 미반영으로 실제 날짜와 ±1~2일 차이날 수 있습니다.")
 
 
 st.markdown("---")
