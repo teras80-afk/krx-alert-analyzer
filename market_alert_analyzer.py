@@ -386,6 +386,130 @@ def filter_cb_bw_outstanding(df_debt: pd.DataFrame) -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
+@st.cache_data(ttl=3600)
+def fetch_cb_conversion_periods(ticker: str) -> pd.DataFrame:
+    """
+    해당 종목의 CB/BW 발행공시에서 전환청구기간 정보 추출.
+    OpenDartReader의 event() 메서드 사용 (주요사항보고서 주요정보).
+    컬럼명이 API 버전/시점에 따라 다를 수 있어 여러 후보 탐색.
+    """
+    dart, _ = get_dart_client()
+    if dart is None:
+        return pd.DataFrame()
+
+    start = (datetime.now() - timedelta(days=365 * 5)).strftime("%Y-%m-%d")
+    end = datetime.now().strftime("%Y-%m-%d")
+
+    frames = []
+    # CB
+    try:
+        df_cb = dart.event(ticker, "전환사채권 발행결정", start=start, end=end)
+        if df_cb is not None and len(df_cb) > 0:
+            df_cb = df_cb.copy()
+            df_cb["_사채종류"] = "CB"
+            frames.append(df_cb)
+    except Exception:
+        pass
+    # BW
+    try:
+        df_bw = dart.event(ticker, "신주인수권부사채권 발행결정", start=start, end=end)
+        if df_bw is not None and len(df_bw) > 0:
+            df_bw = df_bw.copy()
+            df_bw["_사채종류"] = "BW"
+            frames.append(df_bw)
+    except Exception:
+        pass
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True, sort=False)
+
+    def _find_col(candidates, keywords_kr=None):
+        """후보 컬럼명 우선, 없으면 한국어 키워드 매칭으로 탐색"""
+        for c in candidates:
+            if c in df.columns:
+                return c
+        if keywords_kr:
+            for c in df.columns:
+                s = str(c)
+                if all(k in s for k in keywords_kr):
+                    return c
+        return None
+
+    # 전환청구(행사)기간 시작일
+    bgd_col = _find_col(
+        ["cv_prd_bgd", "ex_prd_bgd", "cvRgBgd", "exRgBgd"],
+        keywords_kr=["전환", "시작"]
+    )
+    edd_col = _find_col(
+        ["cv_prd_edd", "ex_prd_edd", "cvRgEdd", "exRgEdd"],
+        keywords_kr=["전환", "종료"]
+    )
+    prc_col = _find_col(["cv_prc", "ex_prc", "cvPrc", "exPrc"])
+    tm_col = _find_col(["bd_tm", "bdTm"])
+    fta_col = _find_col(["bd_fta", "bdFta"])
+
+    if bgd_col is None:
+        # 시작일을 도저히 못 찾으면 빈 DF
+        return pd.DataFrame()
+
+    out = pd.DataFrame({
+        "사채종류": df["_사채종류"],
+        "회차": df[tm_col] if tm_col else "-",
+        "권면총액": df[fta_col] if fta_col else "-",
+        "전환청구개시일": df[bgd_col],
+        "전환청구종료일": df[edd_col] if edd_col else "-",
+        "전환가액": df[prc_col] if prc_col else "-",
+    })
+    return out.reset_index(drop=True)
+
+
+def _parse_date_flex(s):
+    """다양한 포맷의 날짜 문자열을 Timestamp로"""
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s in ("", "-", "—", "nan", "None"):
+        return None
+    for fmt in ["%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%Y%m%d"]:
+        try:
+            return pd.to_datetime(s, format=fmt)
+        except Exception:
+            continue
+    try:
+        return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        return None
+
+
+def find_imminent_conversions(ticker: str, days_threshold: int = 30) -> list:
+    """
+    D-{days_threshold} 이내에 전환청구개시일이 도래하는 CB/BW 건 리스트.
+    이미 개시된 것은 제외 (D-Day가 0 이상인 것만).
+    """
+    df = fetch_cb_conversion_periods(ticker)
+    if df.empty:
+        return []
+
+    today = pd.Timestamp.now().normalize()
+    results = []
+    for _, row in df.iterrows():
+        bgd_dt = _parse_date_flex(row.get("전환청구개시일"))
+        if bgd_dt is None:
+            continue
+        days_to = (bgd_dt.normalize() - today).days
+        if 0 <= days_to <= days_threshold:
+            results.append({
+                "사채종류": row.get("사채종류", "-"),
+                "회차": str(row.get("회차", "-")),
+                "권면총액": row.get("권면총액", "-"),
+                "전환청구개시일": bgd_dt.strftime("%Y-%m-%d"),
+                "전환가액": row.get("전환가액", "-"),
+                "D_days": days_to,
+            })
+    return results
+
 
 def detect_anomaly(df):
     if df.empty:
@@ -760,6 +884,50 @@ with tab2:
                     st.success("✅ 전체 정상")
                 st.dataframe(df_sum, use_container_width=True, hide_index=True)
                 st.caption(f"기준일: {end} | {len(lines)}개")
+
+                # ─── CB/BW 전환청구 개시 임박 (D-30) ───
+                dart_client_check, _ = get_dart_client()
+                if dart_client_check is not None:
+                    st.markdown("---")
+                    imminent_rows = []
+                    prog2 = st.progress(0, text="CB/BW 전환청구 개시일 체크 중...")
+                    for i, line in enumerate(lines):
+                        prog2.progress((i + 1) / len(lines),
+                                        text=f"CB/BW 체크 중... {line}")
+                        t = resolve_ticker(line, name_map)
+                        if not t:
+                            continue
+                        nm = name_map.get(t, line)
+                        try:
+                            hits = find_imminent_conversions(t, days_threshold=30)
+                        except Exception:
+                            hits = []
+                        for h in hits:
+                            imminent_rows.append({
+                                "종목": nm,
+                                "코드": t,
+                                "사채종류": h["사채종류"],
+                                "회차": h["회차"],
+                                "전환청구개시일": h["전환청구개시일"],
+                                "D-Day": f"D-{h['D_days']}" if h["D_days"] > 0 else "D-Day",
+                                "전환가액": h["전환가액"],
+                                "_d": h["D_days"],
+                            })
+                    prog2.empty()
+
+                    if imminent_rows:
+                        df_imm = (pd.DataFrame(imminent_rows)
+                                  .sort_values("_d")
+                                  .drop(columns=["_d"]))
+                        st.warning(f"🏦 **CB/BW 전환청구 개시 임박 (D-30 이내)** — "
+                                   f"{len(imminent_rows)}건")
+                        st.dataframe(df_imm, use_container_width=True, hide_index=True)
+                        st.caption("💡 해당 날짜부터 미상환 CB/BW가 주식으로 전환 청구 "
+                                   "가능합니다. 오버행(물량 출회) 주의. "
+                                   "※ 발행공시상 명시된 '전환청구기간 시작일' 기준. "
+                                   "정확한 조건은 DART 원문 확인 필요.")
+                    else:
+                        st.info("🏦 관심종목 중 D-30 이내 전환청구 개시 예정 CB/BW 없음")
 
 
 # ───────────────────────────────────────────────────────────
