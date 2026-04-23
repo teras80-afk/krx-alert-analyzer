@@ -662,6 +662,22 @@ with tab3:
 
             st.markdown(f"**총 {len(df)}개 종목 지정 중** "
                         f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
+
+            # 🔧 디버그 정보 — 해제 예정일 문제 진단용
+            with st.expander("🔧 디버그 정보 (데이터 구조 확인)", expanded=False):
+                st.write("**컬럼 전체:**", list(df.columns))
+                if designated_col:
+                    st.write(f"**인식된 지정일 컬럼:** `{designated_col}`")
+                    sample_values = df[designated_col].head(3).tolist()
+                    st.write(f"**지정일 컬럼 값 샘플 (상위 3개):** {sample_values}")
+                    # 각 샘플에 대해 계산 결과도 표시
+                    for v in sample_values:
+                        calc = calculate_release_date(category, str(v))
+                        st.write(f"  - `{v}` → 해제 판단일: `{calc}`")
+                else:
+                    st.warning("지정일로 인식된 컬럼이 없습니다. "
+                               "컬럼명에 '지정일'이 포함되지 않은 것 같습니다.")
+
             st.dataframe(df, use_container_width=True, hide_index=True)
 
             # 해제 판단일 설명
