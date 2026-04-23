@@ -16,11 +16,11 @@ from datetime import datetime, timedelta
 from io import StringIO
 
 try:
-    from OpenDartReader import OpenDartReader as _OpenDartReader
+    import OpenDartReader as _ODR
     _HAS_DART = True
     _DART_IMPORT_ERR = ""
 except Exception as _e:
-    _OpenDartReader = None
+    _ODR = None
     _HAS_DART = False
     _DART_IMPORT_ERR = f"{type(_e).__name__}: {_e}"
 
@@ -260,7 +260,7 @@ def get_dart_client():
     if not api_key or not str(api_key).strip():
         return None, "DART_API_KEY가 빈 값입니다"
     try:
-        return _OpenDartReader(str(api_key).strip()), ""
+        return _ODR(str(api_key).strip()), ""
     except Exception as e:
         return None, f"OpenDartReader 초기화 실패: {type(e).__name__}: {e}"
 
