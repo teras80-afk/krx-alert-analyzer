@@ -18,8 +18,10 @@ from io import StringIO
 try:
     import OpenDartReader
     _HAS_DART = True
-except Exception:
+    _DART_IMPORT_ERR = ""
+except Exception as _e:
     _HAS_DART = False
+    _DART_IMPORT_ERR = f"{type(_e).__name__}: {_e}"
 
 st.set_page_config(page_title="예고 임계값 조회기", layout="wide")
 st.title("🔍 투경예고 / 단기과열예고 조회")
@@ -244,14 +246,19 @@ def add_to_watchlist(stock_names: list) -> str:
 # ─────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_dart_client():
-    """DART API 클라이언트. secrets에 DART_API_KEY 없으면 None"""
+    """DART API 클라이언트. 반환: (client, error_msg)"""
     if not _HAS_DART:
-        return None
+        return None, f"OpenDartReader 로딩 실패: {_DART_IMPORT_ERR}"
     try:
         api_key = st.secrets["DART_API_KEY"]
-        return OpenDartReader.OpenDartReader(api_key)
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"secrets에서 DART_API_KEY 읽기 실패: {type(e).__name__}: {e}"
+    if not api_key or not str(api_key).strip():
+        return None, "DART_API_KEY가 빈 값입니다"
+    try:
+        return OpenDartReader.OpenDartReader(str(api_key).strip()), ""
+    except Exception as e:
+        return None, f"OpenDartReader 초기화 실패: {type(e).__name__}: {e}"
 
 
 @st.cache_data(ttl=3600)
@@ -260,7 +267,7 @@ def fetch_cb_bw_disclosures(ticker: str, years_back: int = 5) -> pd.DataFrame:
     최근 N년간 해당 종목의 CB/BW 발행결정 공시 목록 조회.
     kind='B' (주요사항보고) 중에서 'CB 발행결정' / 'BW 발행결정' 필터링.
     """
-    dart = get_dart_client()
+    dart, _ = get_dart_client()
     if dart is None:
         return pd.DataFrame()
 
@@ -301,7 +308,7 @@ def fetch_debt_securities_latest(ticker: str) -> tuple[pd.DataFrame, str]:
     가장 최근 정기보고서(분기/반기/사업)의 '채무증권 발행실적' 조회.
     반환: (DataFrame, 보고서설명). 실패 시 (빈 DF, 에러메시지)
     """
-    dart = get_dart_client()
+    dart, _ = get_dart_client()
     if dart is None:
         return pd.DataFrame(), "DART API 미설정"
 
@@ -839,15 +846,19 @@ with tab4:
                "**발행 공시는 실시간**, **미상환 잔액은 가장 최근 정기보고서 기준(분기 단위)**입니다.")
 
     # DART 클라이언트 상태 체크
-    dart_client = get_dart_client()
+    dart_client, dart_err = get_dart_client()
     if not _HAS_DART:
-        st.error("❌ OpenDartReader 라이브러리가 설치되지 않았습니다. "
-                 "`requirements.txt`에 `OpenDartReader>=0.2.1`을 추가하고 재배포하세요.")
+        st.error("❌ OpenDartReader 라이브러리 로딩 실패")
+        st.code(_DART_IMPORT_ERR or "(알 수 없는 원인)")
+        st.caption("`requirements.txt`에 `OpenDartReader>=0.2.1`이 있는지, "
+                   "그리고 Python 버전 호환성을 확인하세요.")
         st.stop()
     if dart_client is None:
-        st.error("❌ DART API 키가 설정되지 않았습니다. "
-                 "Streamlit Secrets에 `DART_API_KEY = \"...\"` 형태로 추가하세요. "
-                 "키 발급: https://opendart.fss.or.kr/")
+        st.error("❌ DART 클라이언트 초기화 실패")
+        st.code(dart_err or "(알 수 없는 원인)")
+        st.caption("Streamlit Secrets에 `DART_API_KEY = \"...\"` 형태로 올바르게 "
+                   "추가되어 있는지 확인하세요. "
+                   "키 발급: https://opendart.fss.or.kr/")
         st.stop()
 
     # 종목 입력
