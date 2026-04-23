@@ -42,7 +42,10 @@ def get_ticker_name_map() -> dict:
 def resolve_ticker(user_input: str, name_map: dict) -> str | None:
     s = user_input.strip()
     if s.isdigit() and len(s) == 6:
-        return s if s in name_map else None
+        # name_map이 비어있으면 검증 불가 → 그대로 통과
+        return s if (not name_map or s in name_map) else None
+    if not name_map:
+        return None
     for t, n in name_map.items():
         if n == s:
             return t
@@ -521,13 +524,18 @@ def build_price_chart(df, warn_ev, oh_ev, days=60):
 
 
 # ─────────────────────────────────────────────────────────────
-# 종목명 매핑
+# 종목명 매핑 (실패해도 앱 전체 정지시키지 않음)
 # ─────────────────────────────────────────────────────────────
 try:
     name_map = get_ticker_name_map()
+    _name_map_err = ""
 except Exception as e:
-    st.error(f"종목 리스트 로딩 실패: {e}")
-    st.stop()
+    name_map = {}
+    _name_map_err = str(e)[:200]
+    st.warning(
+        f"⚠️ KRX 종목 리스트 로딩 실패 — 종목명 검색은 불가하지만 "
+        f"**6자리 종목코드 직접 입력은 가능**합니다. (원인: {_name_map_err})"
+    )
 
 
 # ═══════════════════════════════════════════════════════════
@@ -554,7 +562,7 @@ with tab1:
         if not ticker:
             st.error("종목을 찾지 못했습니다.")
         else:
-            name = name_map[ticker]
+            name = name_map.get(ticker, ticker)
             end = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
 
@@ -699,7 +707,7 @@ with tab2:
                                      "상태": "❓", "투경예고": "❓",
                                      "단기과열예고": "❓", "_정렬": 99})
                         continue
-                    name = name_map[ticker]
+                    name = name_map.get(ticker, ticker)
                     try:
                         df = load_ohlcv(ticker, start, end)
                         if df.empty:
@@ -876,7 +884,7 @@ with tab4:
         if not ticker:
             st.error("종목을 찾지 못했습니다.")
         else:
-            name = name_map[ticker]
+            name = name_map.get(ticker, ticker)
             st.markdown(f"### 📍 {name} ({ticker})")
 
             # ─── 섹션 1: 발행 공시 이력 ───
