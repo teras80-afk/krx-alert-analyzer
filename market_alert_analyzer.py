@@ -68,6 +68,46 @@ NAVER_URLS = {
 }
 
 
+def calculate_release_date(category: str, designated_date_str: str) -> str:
+    """지정일에서 해제 판단일 계산 (거래일 기준)
+    - 단기과열: 지정일 + 3 거래일 (확정 해제일)
+    - 투자경고/투자위험: 지정일 + 10 거래일 (해제 평가 시작일)
+    """
+    if not designated_date_str or designated_date_str in ("—", "nan", ""):
+        return "—"
+
+    # 다양한 날짜 포맷 시도
+    dt = None
+    s = str(designated_date_str).strip()
+    current_year = datetime.now().year
+
+    for fmt in ["%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
+        try:
+            dt = pd.to_datetime(s, format=fmt)
+            break
+        except Exception:
+            continue
+
+    # 년도 없는 MM.DD 같은 경우 — 현재 연도 가정
+    if dt is None:
+        for fmt in ["%m.%d", "%m-%d", "%m/%d"]:
+            try:
+                dt = pd.to_datetime(f"{current_year}.{s.replace('-', '.').replace('/', '.')}",
+                                    format="%Y.%m.%d")
+                break
+            except Exception:
+                continue
+
+    if dt is None:
+        return "—"
+
+    # 거래일 기준 계산 (주말 제외, 공휴일 미반영이라 ±1일 오차 가능)
+    days = 3 if category == "단기과열" else 10
+    release_dt = dt + pd.offsets.BDay(days)
+
+    return release_dt.strftime("%Y-%m-%d")
+
+
 @st.cache_data(ttl=600)
 def fetch_designated_stocks(category: str) -> tuple[pd.DataFrame, str]:
     """네이버 금융에서 지정종목 리스트 스크래핑"""
@@ -600,9 +640,38 @@ with tab3:
                     name_col = c
                     break
 
+            # 지정일 컬럼 찾기 → 해제 판단일 계산 후 맨 뒤에 추가
+            designated_col = None
+            for c in df.columns:
+                if "지정일" in str(c):
+                    designated_col = c
+                    break
+
+            # 컬럼 제목
+            release_col_name = ("해제 예정일" if category == "단기과열"
+                                else "해제 평가 시작일")
+
+            if designated_col:
+                df = df.copy()
+                df[release_col_name] = df[designated_col].apply(
+                    lambda d: calculate_release_date(category, str(d))
+                )
+            else:
+                df = df.copy()
+                df[release_col_name] = "—"
+
             st.markdown(f"**총 {len(df)}개 종목 지정 중** "
                         f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
             st.dataframe(df, use_container_width=True, hide_index=True)
+
+            # 해제 판단일 설명
+            if category == "단기과열":
+                st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
+                           "단, 지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장될 수 있음.")
+            else:
+                st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
+                           "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
+            st.caption("※ 공휴일은 반영되지 않아 실제 날짜와 ±1~2일 차이날 수 있습니다.")
 
             # 관심종목 일괄 추가
             if name_col and _github_config():
