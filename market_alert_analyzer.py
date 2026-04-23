@@ -625,8 +625,7 @@ with tab3:
 
             if status != "ok":
                 st.error(f"조회 실패: {status}")
-                st.caption("네이버 금융 URL 구조가 바뀌었을 수 있습니다. "
-                           "상단 ▲ 아이콘의 'Manage app → View logs'에서 상세 로그 확인 가능.")
+                st.caption("네이버 금융 URL 구조가 바뀌었을 수 있습니다.")
                 return
 
             if df.empty:
@@ -640,54 +639,83 @@ with tab3:
                     name_col = c
                     break
 
-            # 지정일 컬럼 찾기 → 해제 판단일 계산 후 맨 뒤에 추가
+            # 지정일 컬럼 찾기
             designated_col = None
             for c in df.columns:
                 if "지정일" in str(c):
                     designated_col = c
                     break
 
-            # 컬럼 제목
-            release_col_name = ("해제 예정일" if category == "단기과열"
-                                else "해제 평가 시작일")
+            df = df.copy()
 
+            # 지정일이 있으면 해제 판단일 계산, 없으면 종목별 네이버 링크로 대체
             if designated_col:
-                df = df.copy()
+                release_col_name = ("해제 예정일" if category == "단기과열"
+                                    else "해제 평가 시작일")
                 df[release_col_name] = df[designated_col].apply(
                     lambda d: calculate_release_date(category, str(d))
                 )
+
+            # 종목명 → 종목코드 매핑해서 네이버 링크 생성
+            # name_map은 {code: name} 이므로 역매핑 필요
+            reverse_map = {v: k for k, v in name_map.items()}
+
+            if name_col:
+                def make_link(name):
+                    code = reverse_map.get(str(name).strip())
+                    if not code:
+                        return ""
+                    return f"https://finance.naver.com/item/main.naver?code={code}"
+                df["상세(네이버)"] = df[name_col].apply(make_link)
+
+            # 요약 표시
+            if category == "단기과열" and not designated_col:
+                st.markdown(f"**총 {len(df)}개 종목 지정 중** "
+                            f"(기준: {datetime.now():%Y-%m-%d %H:%M}) | "
+                            f"⏱️ **전 종목 최대 3거래일 내 자동 해제 예정**")
             else:
-                df = df.copy()
-                df[release_col_name] = "—"
+                st.markdown(f"**총 {len(df)}개 종목 지정 중** "
+                            f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
 
-            st.markdown(f"**총 {len(df)}개 종목 지정 중** "
-                        f"(기준: {datetime.now():%Y-%m-%d %H:%M} 조회)")
+            # 데이터프레임 + 링크 컬럼 설정
+            try:
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "상세(네이버)": st.column_config.LinkColumn(
+                            "상세(네이버)",
+                            display_text="🔗 열기",
+                            help="네이버 종목 페이지에서 지정일·공시 확인",
+                        ),
+                    },
+                )
+            except Exception:
+                # 구버전 Streamlit 호환
+                st.dataframe(df, use_container_width=True, hide_index=True)
 
-            # 🔧 디버그 정보 — 해제 예정일 문제 진단용
-            with st.expander("🔧 디버그 정보 (데이터 구조 확인)", expanded=False):
-                st.write("**컬럼 전체:**", list(df.columns))
-                if designated_col:
-                    st.write(f"**인식된 지정일 컬럼:** `{designated_col}`")
-                    sample_values = df[designated_col].head(3).tolist()
-                    st.write(f"**지정일 컬럼 값 샘플 (상위 3개):** {sample_values}")
-                    # 각 샘플에 대해 계산 결과도 표시
-                    for v in sample_values:
-                        calc = calculate_release_date(category, str(v))
-                        st.write(f"  - `{v}` → 해제 판단일: `{calc}`")
+            # 안내
+            if not designated_col:
+                if category == "단기과열":
+                    st.caption("📅 네이버 페이지에 지정일 정보가 포함되어 있지 않아 "
+                               "정확한 해제일 자동 계산이 불가합니다. "
+                               "다만 **단기과열은 지정 후 3거래일 경과 시 자동 해제**이므로, "
+                               "이 리스트에 있는 종목은 **늦어도 3거래일 이내 해제 예정**입니다. "
+                               "정확한 지정일은 '🔗 열기' 클릭 → 네이버 종목 페이지에서 확인.")
                 else:
-                    st.warning("지정일로 인식된 컬럼이 없습니다. "
-                               "컬럼명에 '지정일'이 포함되지 않은 것 같습니다.")
-
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
-            # 해제 판단일 설명
-            if category == "단기과열":
-                st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
-                           "단, 지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장될 수 있음.")
+                    st.caption("📅 네이버 페이지에 지정일 정보가 없어 해제 평가 시작일 "
+                               "자동 계산이 불가합니다. '🔗 열기' 클릭 → 네이버 종목 페이지에서 "
+                               "지정 관련 공시를 확인하세요. "
+                               f"({category}는 지정일 + 10거래일 경과 + 주가 조건 충족 시 해제)")
             else:
-                st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
-                           "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
-            st.caption("※ 공휴일은 반영되지 않아 실제 날짜와 ±1~2일 차이날 수 있습니다.")
+                if category == "단기과열":
+                    st.caption("📅 **해제 예정일**: 지정일 + 3거래일 (자동해제 확정). "
+                               "지정종료일 종가가 지정일 전일보다 20%+ 상승 시 3거래일 연장 가능.")
+                else:
+                    st.caption("📅 **해제 평가 시작일**: 지정일 + 10거래일 "
+                               "(이 날 이후 주가 조건 충족 시 해제 가능. 자동해제 아님).")
+                st.caption("※ 공휴일 미반영으로 실제 날짜와 ±1~2일 차이날 수 있음.")
 
             # 관심종목 일괄 추가
             if name_col and _github_config():
