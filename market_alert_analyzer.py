@@ -105,6 +105,143 @@ def load_ohlcv(ticker: str, start: str, end: str) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────
+# DART Open API — CB/BW 발행 이력 조회
+# ─────────────────────────────────────────────────────────────
+DART_API_BASE = "https://opendart.fss.or.kr/api"
+
+
+def _dart_api_key():
+    """Streamlit secrets에서 DART API 키 가져오기. 없으면 None."""
+    try:
+        return st.secrets["DART_API_KEY"]
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400)  # 1일 캐시 (종목-회사코드 매핑은 거의 안 변함)
+def get_dart_corp_code_map() -> dict:
+    """
+    DART 회사 고유번호(corp_code) 매핑.
+    DART는 종목코드(6자리) 대신 자체 corp_code(8자리)를 쓰므로 변환 필요.
+    반환: {stock_code(6자리): corp_code(8자리)}
+    """
+    key = _dart_api_key()
+    if not key:
+        return {}
+
+    url = f"{DART_API_BASE}/corpCode.xml"
+    try:
+        r = requests.get(url, params={"crtfc_key": key}, timeout=15)
+        if r.status_code != 200:
+            return {}
+
+        # 응답은 zip 파일 (CORPCODE.xml 포함)
+        import zipfile
+        import io
+        import xml.etree.ElementTree as ET
+
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            with z.open("CORPCODE.xml") as f:
+                tree = ET.parse(f)
+                root = tree.getroot()
+
+        mapping = {}
+        for item in root.findall("list"):
+            stock = item.findtext("stock_code", "").strip()
+            corp = item.findtext("corp_code", "").strip()
+            if stock and corp and len(stock) == 6:
+                mapping[stock] = corp
+        return mapping
+    except Exception:
+        return {}
+
+
+@st.cache_data(ttl=21600)  # 6시간 캐시
+def fetch_cb_bw_disclosures(stock_code: str, months: int = 12) -> tuple[list, str]:
+    """
+    특정 종목의 최근 CB/BW 발행 공시 조회.
+    반환: (공시 리스트, 상태 메시지)
+    각 항목: {report_nm, rcept_dt, rcept_no, corp_name, type}
+    """
+    key = _dart_api_key()
+    if not key:
+        return [], "DART API 키 미설정"
+
+    corp_map = get_dart_corp_code_map()
+    corp_code = corp_map.get(stock_code)
+    if not corp_code:
+        return [], f"DART 회사코드 매핑 없음 (종목코드 {stock_code})"
+
+    end_dt = datetime.now()
+    start_dt = end_dt - timedelta(days=months * 31)
+
+    url = f"{DART_API_BASE}/list.json"
+    params = {
+        "crtfc_key": key,
+        "corp_code": corp_code,
+        "bgn_de": start_dt.strftime("%Y%m%d"),
+        "end_de": end_dt.strftime("%Y%m%d"),
+        "page_count": 100,
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return [], f"HTTP {r.status_code}"
+        js = r.json()
+    except Exception as e:
+        return [], f"요청 실패: {str(e)[:100]}"
+
+    if js.get("status") != "000":
+        # 000이 성공, 013은 조회 결과 없음
+        if js.get("status") == "013":
+            return [], "no_data"
+        return [], f"API 오류: {js.get('status')} - {js.get('message', '')}"
+
+    # CB/BW 관련 공시명 필터링
+    cb_bw_items = []
+    for item in js.get("list", []):
+        report_nm = item.get("report_nm", "")
+        # 전환사채 / 신주인수권부사채 관련 공시
+        if any(k in report_nm for k in ["전환사채", "신주인수권부사채", "교환사채"]):
+            disclosure_type = "CB (전환사채)"
+            if "신주인수권부사채" in report_nm:
+                disclosure_type = "BW (신주인수권부)"
+            elif "교환사채" in report_nm:
+                disclosure_type = "EB (교환사채)"
+
+            cb_bw_items.append({
+                "공시일": item.get("rcept_dt", ""),
+                "공시명": report_nm,
+                "유형": disclosure_type,
+                "접수번호": item.get("rcept_no", ""),
+                "링크": (f"https://dart.fss.or.kr/dsaf001/main.do"
+                         f"?rcpNo={item.get('rcept_no', '')}"),
+            })
+
+    return cb_bw_items, "ok"
+
+
+def format_cb_bw_table(items: list) -> pd.DataFrame:
+    """CB/BW 공시 리스트를 DataFrame으로."""
+    if not items:
+        return pd.DataFrame()
+    rows = []
+    for it in items:
+        # 공시일 YYYYMMDD → YYYY-MM-DD
+        d = it["공시일"]
+        if len(d) == 8:
+            d = f"{d[:4]}-{d[4:6]}-{d[6:]}"
+        rows.append({
+            "공시일": d,
+            "유형": it["유형"],
+            "공시명": it["공시명"],
+            "DART 링크": it["링크"],
+        })
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────
 # 현재 지정종목 스크래핑 (네이버 금융)
 # ─────────────────────────────────────────────────────────────
 NAVER_URLS = {
@@ -778,6 +915,44 @@ with tab1:
                 st.caption("💡 예고 ↔ 지정 임계값은 **수치상 동일**합니다. "
                            "다만 이미 예고된 상태에서 재충족하면 '지정'으로, "
                            "예고 이력 없을 때 충족하면 '예고'로 발동됩니다.")
+
+                # ─── CB/BW 발행 이력 (DART API) ───
+                st.markdown("---")
+                st.markdown("#### 📄 최근 CB/BW 발행 이력 (최근 1년)")
+
+                if _dart_api_key() is None:
+                    st.info("DART API 키가 등록되지 않아 CB/BW 조회를 생략합니다. "
+                            "Streamlit Secrets에 `DART_API_KEY`를 추가하세요.")
+                else:
+                    with st.spinner("DART에서 공시 조회 중..."):
+                        cb_items, cb_status = fetch_cb_bw_disclosures(ticker, months=12)
+
+                    if cb_status == "ok" and cb_items:
+                        st.warning(f"⚠️ 최근 1년 내 **{len(cb_items)}건** "
+                                   f"의 CB/BW 관련 공시가 있습니다. "
+                                   "주가 급등이 전환가액·발행 시점과 관련될 수 있으니 "
+                                   "공시 본문 확인을 권장합니다.")
+                        try:
+                            st.dataframe(
+                                format_cb_bw_table(cb_items),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "DART 링크": st.column_config.LinkColumn(
+                                        "DART 링크",
+                                        display_text="🔗 공시 보기",
+                                    ),
+                                },
+                            )
+                        except Exception:
+                            st.dataframe(format_cb_bw_table(cb_items),
+                                         use_container_width=True, hide_index=True)
+                    elif cb_status == "no_data":
+                        st.success("✅ 최근 1년 내 CB/BW 관련 공시 없음")
+                    elif cb_status == "ok":
+                        st.success("✅ 최근 1년 내 CB/BW 관련 공시 없음")
+                    else:
+                        st.caption(f"ℹ️ CB/BW 조회 건너뜀: {cb_status}")
 
                 st.markdown("---")
                 st.markdown("#### 📈 최근 60일 종가 + 임계값")
