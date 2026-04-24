@@ -21,6 +21,61 @@ PROXIMITY_PCT = 0.95
 
 
 # ─────────────────────────────────────────────────────────────
+# 사이드바 — 임계값 프리셋 설정
+# ─────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ 임계값 설정")
+    st.caption("KRX 유형별로 기준이 달라서 조정 가능하게 해뒀습니다. "
+               "기본값은 실제 예고 사례 분석 기반.")
+
+    preset = st.selectbox(
+        "프리셋",
+        [
+            "단기상승&불건전 (5일×1.45 / 15일×1.75) — 기본",
+            "중장기상승&불건전 (20일×1.60 / 60일×2.00)",
+            "위험 해제요건 (5일×1.60 / 15일×2.00)",
+            "구버전 (5일×1.60 / 20일×2.00)",
+            "직접 설정",
+        ],
+        index=0,
+        key="threshold_preset",
+    )
+
+    if preset.startswith("단기상승"):
+        short_days, short_mult = 5, 1.45
+        long_days, long_mult = 15, 1.75
+    elif preset.startswith("중장기상승"):
+        short_days, short_mult = 20, 1.60
+        long_days, long_mult = 60, 2.00
+    elif preset.startswith("위험"):
+        short_days, short_mult = 5, 1.60
+        long_days, long_mult = 15, 2.00
+    elif preset.startswith("구버전"):
+        short_days, short_mult = 5, 1.60
+        long_days, long_mult = 20, 2.00
+    else:
+        # 직접 설정
+        short_days = st.number_input("단기 기준일수", 2, 30, 5, key="sd_short")
+        short_mult = st.number_input("단기 배수", 1.0, 3.0, 1.45, 0.05,
+                                      key="sm_short")
+        long_days = st.number_input("장기 기준일수", 5, 100, 15, key="sd_long")
+        long_mult = st.number_input("장기 배수", 1.0, 5.0, 1.75, 0.05,
+                                     key="sm_long")
+
+    if not preset.startswith("직접"):
+        st.markdown(f"- 단기: **{short_days}일 × {short_mult:.2f}**")
+        st.markdown(f"- 장기: **{long_days}일 × {long_mult:.2f}**")
+
+    require_max15 = st.checkbox("③ 15일 최고가 조건 적용", value=True,
+                                 key="require_max15",
+                                 help="일부 유형은 이 조건이 없음")
+
+    st.markdown("---")
+    st.caption("💡 가온전선처럼 기본값으로 탈락한 종목이 있다면 "
+               "프리셋을 '단기상승&불건전'으로 두세요 (현재 기본값).")
+
+
+# ─────────────────────────────────────────────────────────────
 # 데이터 로더
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
@@ -403,23 +458,42 @@ def detect_anomaly(df):
     return {"anomaly": False, "reason": ""}
 
 
-def evaluate_warning(df, idx):
+def evaluate_warning(df, idx,
+                      short_days: int = 5, short_mult: float = 1.45,
+                      long_days: int = 15, long_mult: float = 1.75,
+                      require_max15: bool = True):
+    """투자경고/위험 요건 판정.
+    기본값은 '단기상승&불건전' 해제요건(5일 +45%, 15일 +75%) 기반.
+    투자위험으로 쓸 때는 (5, 1.60, 15, 2.00)으로 호출.
+    """
     curr = int(df["종가"].iloc[idx])
-    if idx < 20:
-        return {"status": None, "reason": "데이터 부족"}
-    p5 = int(df["종가"].iloc[idx - 5])
-    p20 = int(df["종가"].iloc[idx - 20])
+    required = max(long_days, short_days)
+    if idx < required:
+        return {"status": None, "reason": f"데이터 부족({required}거래일 미만)"}
+    p_short = int(df["종가"].iloc[idx - short_days])
+    p_long = int(df["종가"].iloc[idx - long_days])
     max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
-    th1, th2, th3 = int(p5 * 1.6), int(p20 * 2.0), max15
-    c1, c2, c3 = curr >= th1, curr >= th2, curr >= th3
-    ratios = [curr / th1 if th1 else 0, curr / th2 if th2 else 0,
-              curr / th3 if th3 else 0]
+    th1 = int(p_short * short_mult)
+    th2 = int(p_long * long_mult)
+    th3 = max15
+    c1 = curr >= th1
+    c2 = curr >= th2
+    c3 = (curr >= th3) if require_max15 else True
+    ratios = [
+        curr / th1 if th1 else 0,
+        curr / th2 if th2 else 0,
+        curr / th3 if (th3 and require_max15) else (1.0 if c3 else 0),
+    ]
     return {
         "status": all([c1, c2, c3]), "current": curr,
-        "thresholds": {"5일x1.6": th1, "20일x2.0": th2, "15일최고": th3},
+        "thresholds": {
+            f"{short_days}일x{short_mult:.2f}": th1,
+            f"{long_days}일x{long_mult:.2f}": th2,
+            "15일최고": th3,
+        },
         "criteria": [
-            ("① 5일 전 × 1.6", th1, c1, ratios[0]),
-            ("② 20일 전 × 2.0", th2, c2, ratios[1]),
+            (f"① {short_days}일 전 × {short_mult:.2f}", th1, c1, ratios[0]),
+            (f"② {long_days}일 전 × {long_mult:.2f}", th2, c2, ratios[1]),
             ("③ 15일 최고가", th3, c3, ratios[2]),
         ],
         "max_ratio": max(ratios),
@@ -605,13 +679,22 @@ with tab1:
                 if isinstance(base_idx, slice):
                     base_idx = base_idx.stop - 1
 
-                warn_ev = evaluate_warning(df, base_idx)
+                # 사이드바 설정 적용한 평가 함수
+                def warn_eval_with_params(d, i):
+                    return evaluate_warning(d, i,
+                                            short_days=short_days,
+                                            short_mult=short_mult,
+                                            long_days=long_days,
+                                            long_mult=long_mult,
+                                            require_max15=require_max15)
+
+                warn_ev = warn_eval_with_params(df, base_idx)
                 oh_ev = evaluate_overheat(df, base_idx)
                 curr_p = int(df["종가"].iloc[base_idx])
 
                 # 최근 10거래일 예고 이력 스캔 → 현재 '예고 중' 여부
                 warn_pre, warn_trigger, warn_days_left = \
-                    detect_predesignation_history(df, base_idx, evaluate_warning)
+                    detect_predesignation_history(df, base_idx, warn_eval_with_params)
                 oh_pre, oh_trigger, oh_days_left = \
                     detect_predesignation_history(df, base_idx, evaluate_overheat)
 
@@ -779,7 +862,12 @@ with tab2:
                             raise ValueError
                         idx = len(df) - 1
                         anomaly = detect_anomaly(df)
-                        warn_ev = evaluate_warning(df, idx)
+                        warn_ev = evaluate_warning(df, idx,
+                                                    short_days=short_days,
+                                                    short_mult=short_mult,
+                                                    long_days=long_days,
+                                                    long_mult=long_mult,
+                                                    require_max15=require_max15)
                         oh_ev = evaluate_overheat(df, idx)
                     except Exception:
                         rows.append({"종목": name, "코드": ticker, "종가": "—",
