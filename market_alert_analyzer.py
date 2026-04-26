@@ -190,25 +190,30 @@ def github_put_watchlist(new_content, sha):
     cfg = _github_config()
     if not cfg:
         return False, "GitHub 연동 설정 없음"
+    import json as _json
+    import urllib.request as _urllib
     url = f"https://api.github.com/repos/{cfg['repo']}/contents/{cfg['path']}"
-    headers = {"Authorization": f"Bearer {cfg['token']}",
-               "Accept": "application/vnd.github+json",
-               "Content-Type": "application/json; charset=utf-8"}
     body = {
-        "message": f"Update watchlist ({datetime.now():%Y-%m-%d %H:%M})",
+        "message": f"Update watchlist ({datetime.now().strftime('%Y-%m-%d %H:%M')})",
         "content": base64.b64encode(new_content.encode("utf-8")).decode("ascii"),
         "branch": cfg["branch"],
     }
     if sha:
         body["sha"] = sha
     try:
-        import json as _json
-        r = requests.put(url, headers=headers,
-                         data=_json.dumps(body, ensure_ascii=False).encode("utf-8"),
-                         timeout=10)
-        if r.status_code in (200, 201):
-            return True, "저장 완료"
-        return False, f"HTTP 오류 {r.status_code}: {r.text[:200]}"
+        data = _json.dumps(body, ensure_ascii=True).encode("utf-8")
+        req = _urllib.Request(
+            url, data=data, method="PUT",
+            headers={
+                "Authorization": f"Bearer {cfg['token']}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+            }
+        )
+        with _urllib.urlopen(req, timeout=10) as resp:
+            if resp.status in (200, 201):
+                return True, "저장 완료"
+            return False, f"HTTP 오류 {resp.status}"
     except Exception as e:
         return False, str(e)
 
