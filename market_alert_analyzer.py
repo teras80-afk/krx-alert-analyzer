@@ -25,14 +25,28 @@ PROXIMITY_PCT = 0.95
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_ticker_name_map() -> dict:
-    for market in ["KRX", "KOSPI", "KOSDAQ"]:
+    import requests as _req
+    from io import StringIO as _SIO
+    result = {}
+    for market_code in ["0", "1"]:  # 0=KOSPI, 1=KOSDAQ
         try:
-            df = fdr.StockListing(market)
-            if df is not None and len(df) > 0:
-                code_col = "Code" if "Code" in df.columns else "Symbol"
-                return dict(zip(df[code_col].astype(str).str.zfill(6), df["Name"]))
+            url = (f"https://kind.krx.co.kr/corpgeneral/corpList.do"
+                   f"?method=download&searchType=13&marketType={market_code}")
+            r = _req.get(url, timeout=10,
+                         headers={"User-Agent": "Mozilla/5.0"})
+            df = pd.read_html(_SIO(r.content.decode("euc-kr", errors="replace")))[0]
+            df.columns = df.columns.astype(str)
+            name_col = [c for c in df.columns if "회사" in c or "종목" in c or "기업" in c]
+            code_col = [c for c in df.columns if "종목코드" in c or "코드" in c]
+            if name_col and code_col:
+                for _, row in df.iterrows():
+                    code = str(row[code_col[0]]).zfill(6)
+                    name = str(row[name_col[0]])
+                    result[code] = name
         except Exception:
             continue
+    if result:
+        return result
     raise RuntimeError("종목 리스트 로딩 실패")
 
 
