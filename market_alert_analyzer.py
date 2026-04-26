@@ -207,10 +207,10 @@ def github_put_watchlist(new_content, sha):
                          data=_json.dumps(body, ensure_ascii=False).encode("utf-8"),
                          timeout=10)
         if r.status_code in (200, 201):
-            return True, "✅ 저장 완료"
-        return False, f"❌ HTTP {r.status_code}"
+            return True, "저장 완료"
+        return False, f"HTTP 오류 {r.status_code}: {r.text[:200]}"
     except Exception as e:
-        return False, f"❌ {e}"
+        return False, str(e)
 
 
 def parse_watchlist(text):
