@@ -389,10 +389,11 @@ except Exception as e:
 # ═══════════════════════════════════════════════════════════
 # 탭 3개
 # ═══════════════════════════════════════════════════════════
-tab1, tab2, tab3 = st.tabs([
+tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 개별 종목 조회",
     "📋 관심종목 대시보드",
     "📌 현재 지정종목",
+    "🔬 진단",
 ])
 
 # ───────────────────────────────────────────────────────────
@@ -691,6 +692,179 @@ with tab3:
     render_designated("투자경고", sub1)
     render_designated("투자위험", sub2)
     render_designated("단기과열", sub3)
+
+
+# ───────────────────────────────────────────────────────────
+# 탭 4: 진단 (실제 예고/지정 종목 입력 → 어느 기준에 걸리는지 전수 비교)
+# ───────────────────────────────────────────────────────────
+with tab4:
+    st.markdown("### 🔬 종목 진단")
+    st.caption("실제 예고/지정된 종목을 입력하면, 지정일 직전(T-1)의 "
+               "여러 기간 상승률과 다양한 KRX 유형별 기준을 전수 비교해서 "
+               "어느 기준이 실제로 작동했는지 역추적합니다.")
+
+    dcol1, dcol2 = st.columns([2, 1])
+    with dcol1:
+        diag_input = st.text_input(
+            "종목코드 6자리 또는 종목명",
+            value="", key="diag_input",
+            placeholder="예: 가온전선 또는 000500")
+    with dcol2:
+        diag_trigger_date = st.date_input(
+            "예고/지정일 (T)",
+            value=datetime.now().date(),
+            key="diag_trigger_date",
+            help="실제 공시된 예고/지정일. T-1 기준으로 역산합니다.",
+        )
+
+    if diag_input:
+        d_ticker = resolve_ticker(diag_input, name_map)
+        if not d_ticker:
+            st.error("종목을 찾지 못했습니다.")
+        else:
+            d_name = name_map[d_ticker]
+
+            d_end = (datetime.combine(diag_trigger_date, datetime.min.time())
+                     + timedelta(days=10)).strftime("%Y-%m-%d")
+            d_start = (datetime.combine(diag_trigger_date, datetime.min.time())
+                       - timedelta(days=300)).strftime("%Y-%m-%d")
+            try:
+                d_df = load_ohlcv(d_ticker, d_start, d_end)
+            except Exception as e:
+                st.error(f"OHLCV 로딩 실패: {e}")
+                d_df = pd.DataFrame()
+
+            if d_df.empty:
+                st.error("OHLCV 데이터가 비어 있습니다.")
+            else:
+                # T-1 찾기
+                d_dt = pd.Timestamp(diag_trigger_date)
+                prior = d_df.index[d_df.index < d_dt]
+                if len(prior) == 0:
+                    st.error("예고일 이전 거래 데이터가 없습니다.")
+                else:
+                    t1_idx = len(prior) - 1
+                    t1_date = prior[-1]
+                    t1_price = int(d_df["종가"].iloc[t1_idx])
+
+                    st.markdown(f"#### 📍 {d_name} ({d_ticker})")
+                    st.markdown(
+                        f"예고/지정일(T): **{diag_trigger_date}** | "
+                        f"T-1: **{t1_date.strftime('%Y-%m-%d')}** | "
+                        f"T-1 종가: **{t1_price:,}원**"
+                    )
+
+                    # ─── 기간별 상승률 ───
+                    st.markdown("---")
+                    st.markdown("#### 📊 기간별 상승률")
+                    periods = [3, 5, 10, 15, 20, 40, 60]
+                    rate_rows = []
+                    for p in periods:
+                        if t1_idx >= p:
+                            past_p = int(d_df["종가"].iloc[t1_idx - p])
+                            ratio = t1_price / past_p if past_p else 0
+                            pct = (ratio - 1) * 100
+                            rate_rows.append({
+                                "기간": f"{p}일 전",
+                                "과거 종가": f"{past_p:,}원",
+                                "T-1 종가": f"{t1_price:,}원",
+                                "상승률": f"+{pct:.1f}% (×{ratio:.2f})",
+                                "_ratio": ratio,
+                                "_p": p,
+                            })
+                    if rate_rows:
+                        st.dataframe(
+                            pd.DataFrame(rate_rows).drop(columns=["_ratio", "_p"]),
+                            use_container_width=True, hide_index=True)
+
+                    # 15일 최고가 여부
+                    if t1_idx >= 14:
+                        max15 = int(d_df["종가"].iloc[t1_idx - 14: t1_idx + 1].max())
+                        is_max15 = t1_price >= max15
+                        st.markdown(
+                            f"📈 **15일 최고가**: {max15:,}원 "
+                            f"{'✅ 달성' if is_max15 else '❌ 미달성'}"
+                        )
+
+                    # ─── KRX 유형별 기준 전수 비교 ───
+                    st.markdown("---")
+                    st.markdown("#### 🎯 KRX 유형별 기준 전수 비교")
+                    st.caption("※ KRX는 기준을 비공개. 아래는 역추정/추정값입니다.")
+
+                    ratio_map = {r["_p"]: r["_ratio"] for r in rate_rows}
+
+                    def chk(p, mult):
+                        r = ratio_map.get(p)
+                        if r is None:
+                            return "—", "—"
+                        ok = r >= mult
+                        return f"{'✅' if ok else '❌'} {r*100-100:.1f}%", ok
+
+                    types = [
+                        ("단기상승&불건전(역추정)", 5, 1.45, 15, 1.75),
+                        ("현재 앱 기본값",          5, 1.60, 20, 2.00),
+                        ("중장기급등(역추정)",       5, 1.60, 15, 2.00),
+                        ("장기급등(추정)",           20, 1.60, 40, 2.00),
+                        ("초장기급등(추정)",         20, 1.60, 60, 2.00),
+                    ]
+                    type_rows = []
+                    for label, p1, m1, p2, m2 in types:
+                        r1_str, ok1 = chk(p1, m1)
+                        r2_str, ok2 = chk(p2, m2)
+                        both = (ok1 is True and ok2 is True)
+                        type_rows.append({
+                            "유형": label,
+                            f"조건1 ({p1}일×{m1})": r1_str,
+                            f"조건2 ({p2}일×{m2})": r2_str,
+                            "종합": "🔴 충족" if both else "❌",
+                        })
+                    st.dataframe(pd.DataFrame(type_rows),
+                                 use_container_width=True, hide_index=True)
+
+                    # ─── 거래량·변동성 진단 ───
+                    st.markdown("---")
+                    st.markdown("#### 📦 거래량·변동성 진단 (불건전 요건 힌트)")
+
+                    if t1_idx >= 40:
+                        avg2_vol = d_df["거래량"].iloc[t1_idx - 1: t1_idx + 1].mean()
+                        avg40_vol = d_df["거래량"].iloc[t1_idx - 39: t1_idx + 1].mean()
+                        vol_ratio = avg2_vol / avg40_vol if avg40_vol > 0 else 0
+
+                        prev_close = d_df["종가"].shift(1)
+                        daily_vola = (d_df["고가"] - d_df["저가"]) / prev_close
+                        avg2_vola = daily_vola.iloc[t1_idx - 1: t1_idx + 1].mean()
+                        avg40_vola = daily_vola.iloc[t1_idx - 39: t1_idx + 1].mean()
+                        vola_ratio = avg2_vola / avg40_vola if avg40_vola > 0 else 0
+
+                        avg5_vol = d_df["거래량"].iloc[t1_idx - 4: t1_idx + 1].mean()
+                        vol5_ratio = avg5_vol / avg40_vol if avg40_vol > 0 else 0
+
+                        vd_rows = [
+                            {"지표": "최근 2일 거래량 / 40일 평균",
+                             "값": f"×{vol_ratio:.2f}",
+                             "기준": "×6.0 이상(단기과열)",
+                             "해당": "✅" if vol_ratio >= 6.0 else "❌"},
+                            {"지표": "최근 5일 거래량 / 40일 평균",
+                             "값": f"×{vol5_ratio:.2f}",
+                             "기준": "×3~5 수준이면 거래 급증",
+                             "해당": "🔥" if vol5_ratio >= 3.0 else "—"},
+                            {"지표": "최근 2일 변동성 / 40일 평균",
+                             "값": f"×{vola_ratio:.2f}",
+                             "기준": "×1.5 이상(단기과열)",
+                             "해당": "✅" if vola_ratio >= 1.5 else "❌"},
+                        ]
+                        st.dataframe(pd.DataFrame(vd_rows),
+                                     use_container_width=True, hide_index=True)
+                    else:
+                        st.info("데이터 부족(40거래일 미만)으로 거래량·변동성 진단 불가")
+
+                    # ─── 원시 OHLCV ───
+                    with st.expander("📋 T-1 기준 최근 30일 원시 OHLCV 데이터"):
+                        window_start = max(0, t1_idx - 29)
+                        display_df = d_df.iloc[window_start: t1_idx + 1].copy()
+                        display_df.index = display_df.index.strftime("%Y-%m-%d")
+                        st.dataframe(display_df[["종가", "거래량"]],
+                                     use_container_width=True)
 
 
 st.markdown("---")
