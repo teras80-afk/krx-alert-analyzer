@@ -25,9 +25,15 @@ PROXIMITY_PCT = 0.95
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_ticker_name_map() -> dict:
-    df = fdr.StockListing("KRXNEW")
-    code_col = "Code" if "Code" in df.columns else "Symbol"
-    return dict(zip(df[code_col].astype(str).str.zfill(6), df["Name"]))
+    for market in ["KRX", "KOSPI", "KOSDAQ"]:
+        try:
+            df = fdr.StockListing(market)
+            if df is not None and len(df) > 0:
+                code_col = "Code" if "Code" in df.columns else "Symbol"
+                return dict(zip(df[code_col].astype(str).str.zfill(6), df["Name"]))
+        except Exception:
+            continue
+    raise RuntimeError("종목 리스트 로딩 실패")
 
 
 def resolve_ticker(user_input: str, name_map: dict) -> str | None:
