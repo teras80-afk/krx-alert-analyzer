@@ -25,7 +25,7 @@ PROXIMITY_PCT = 0.95
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
 def get_ticker_name_map() -> dict:
-    df = fdr.StockListing("KRX")
+    df = fdr.StockListing("KRXNEW")
     code_col = "Code" if "Code" in df.columns else "Symbol"
     return dict(zip(df[code_col].astype(str).str.zfill(6), df["Name"]))
 
