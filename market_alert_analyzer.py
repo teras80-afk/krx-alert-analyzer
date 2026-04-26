@@ -238,7 +238,7 @@ def add_to_watchlist(stock_names: list) -> str:
         _, new_sha = github_get_watchlist()
         st.session_state.watchlist_sha = new_sha
         return f"✅ {len(to_add)}개 종목 추가됨"
-    return f"❌ 저장 실패: {msg}"
+    return f"저장 실패: {msg}"
 
 
 # ─────────────────────────────────────────────────────────────
