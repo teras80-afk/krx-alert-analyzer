@@ -282,9 +282,6 @@ def detect_anomaly(df):
     return {"anomaly": False, "reason": ""}
 
 
-def evaluate_warning(df, idx):
- def evaluate_warning_score(df, idx):
-    ...
   def evaluate_warning_score(df, idx):
     if idx < 20:
         return {"status": None, "reason": "데이터 부족"}
