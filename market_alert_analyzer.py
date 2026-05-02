@@ -282,7 +282,33 @@ def detect_anomaly(df):
     return {"anomaly": False, "reason": ""}
 
 
-  def evaluate_warning_score(df, idx):
+def evaluate_warning(df, idx):
+    """투자경고 예고: 3대 요건 판정 (criteria/thresholds 반환)."""
+    if idx < 20:
+        return {"status": None, "reason": "데이터 부족"}
+    curr = int(df["종가"].iloc[idx])
+    p5 = int(df["종가"].iloc[idx - 5])
+    p20 = int(df["종가"].iloc[idx - 20])
+    max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
+    th1, th2, th3 = int(p5 * 1.6), int(p20 * 2.0), max15
+    c1, c2, c3 = curr >= th1, curr >= th2, curr >= th3
+    ratios = [curr / th1 if th1 else 0,
+              curr / th2 if th2 else 0,
+              curr / th3 if th3 else 0]
+    return {
+        "status": all([c1, c2, c3]), "current": curr,
+        "thresholds": {"5일x1.6": th1, "20일x2.0": th2, "15일최고": th3},
+        "criteria": [
+            ("① 5일 전 × 1.6", f"{th1:,}원", f"{curr:,}원", c1, ratios[0]),
+            ("② 20일 전 × 2.0", f"{th2:,}원", f"{curr:,}원", c2, ratios[1]),
+            ("③ 15일 최고가", f"{th3:,}원", f"{curr:,}원", c3, ratios[2]),
+        ],
+        "max_ratio": max(ratios),
+    }
+
+
+def evaluate_warning_score(df, idx):
+    """투자경고 예고: 점수 기반 평가."""
     if idx < 20:
         return {"status": None, "reason": "데이터 부족"}
 
@@ -324,26 +350,6 @@ def detect_anomaly(df):
         score += 1
 
     return {"score": score, "status": score >= 6}
-    curr = int(df["종가"].iloc[idx])
-    if idx < 20:
-        return {"status": None, "reason": "데이터 부족"}
-    p5 = int(df["종가"].iloc[idx - 5])
-    p20 = int(df["종가"].iloc[idx - 20])
-    max15 = int(df["종가"].iloc[idx - 14: idx + 1].max())
-    th1, th2, th3 = int(p5 * 1.6), int(p20 * 2.0), max15
-    c1, c2, c3 = curr >= th1, curr >= th2, curr >= th3
-    ratios = [curr / th1 if th1 else 0, curr / th2 if th2 else 0,
-              curr / th3 if th3 else 0]
-    return {
-        "status": all([c1, c2, c3]), "current": curr,
-        "thresholds": {"5일x1.6": th1, "20일x2.0": th2, "15일최고": th3},
-        "criteria": [
-            ("① 5일 전 × 1.6", th1, c1, ratios[0]),
-            ("② 20일 전 × 2.0", th2, c2, ratios[1]),
-            ("③ 15일 최고가", th3, c3, ratios[2]),
-        ],
-        "max_ratio": max(ratios),
-    }
 
 
 def evaluate_overheat(df, idx):
@@ -379,6 +385,45 @@ def evaluate_overheat(df, idx):
         ],
         "max_ratio": max(r1, r2, r3),
     }
+
+
+def evaluate_overheat_score(df, idx):
+    """단기과열 예고: 점수 기반 평가."""
+    if idx < 40:
+        return {"status": None, "reason": "데이터 부족"}
+
+    curr = df["종가"].iloc[idx]
+    avg40_close = df["종가"].iloc[idx - 39: idx + 1].mean()
+    price_ratio = curr / avg40_close if avg40_close else 0
+
+    avg2_vol = df["거래량"].iloc[idx - 1: idx + 1].mean()
+    avg40_vol = df["거래량"].iloc[idx - 39: idx + 1].mean()
+    vol_ratio = avg2_vol / avg40_vol if avg40_vol > 0 else 0
+
+    prev_close = df["종가"].shift(1)
+    daily_vola = (df["고가"] - df["저가"]) / prev_close
+    avg2_vola = daily_vola.iloc[idx - 1: idx + 1].mean()
+    avg40_vola = daily_vola.iloc[idx - 39: idx + 1].mean()
+    vola_ratio = avg2_vola / avg40_vola if avg40_vola > 0 else 0
+
+    score = 0
+
+    if price_ratio >= 1.3:
+        score += 2
+    elif price_ratio >= 1.2:
+        score += 1
+
+    if vol_ratio >= 6.0:
+        score += 2
+    elif vol_ratio >= 4.0:
+        score += 1
+
+    if vola_ratio >= 1.5:
+        score += 2
+    elif vola_ratio >= 1.2:
+        score += 1
+
+    return {"score": score, "status": score >= 6}
 
 
 def status_label(ev):
@@ -502,8 +547,10 @@ with tab1:
                 if isinstance(base_idx, slice):
                     base_idx = base_idx.stop - 1
 
-                warn_ev = evaluate_warning_score(df, base_idx)
-                oh_ev = evaluate_overheat_score(df, base_idx)
+                warn_ev = evaluate_warning(df, base_idx)
+                oh_ev = evaluate_overheat(df, base_idx)
+                warn_score_ev = evaluate_warning_score(df, base_idx)
+                oh_score_ev = evaluate_overheat_score(df, base_idx)
                 curr_p = int(df["종가"].iloc[base_idx])
 
                 st.markdown(f"### 📍 {name} ({ticker})")
@@ -525,16 +572,18 @@ with tab1:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
-                         # 👇 추가 시작
-score = warn_ev_new["score"]
 
-if score >= 6:
-    st.error(f"🔥 점수 기반: 매우 높음 ({score})")
-elif score >= 4:
-    st.warning(f"⚠️ 점수 기반: 예고 가능 ({score})")
-else:
-    st.info(f"ℹ️ 점수 기반: 낮음 ({score})")
-# 👆 추가 끝
+                        # 👇 점수 기반 표시 시작
+                        if warn_score_ev.get("status") is not None:
+                            score = warn_score_ev.get("score", 0)
+                            if score >= 6:
+                                st.error(f"🔥 점수 기반: 매우 높음 ({score})")
+                            elif score >= 4:
+                                st.warning(f"⚠️ 점수 기반: 예고 가능 ({score})")
+                            else:
+                                st.info(f"ℹ️ 점수 기반: 낮음 ({score})")
+                        # 👆 점수 기반 표시 끝
+
                     if warn_ev.get("criteria"):
                         st.dataframe(fmt_warning_table(warn_ev),
                                      use_container_width=True, hide_index=True)
@@ -551,6 +600,18 @@ else:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
+
+                        # 👇 점수 기반 표시 시작
+                        if oh_score_ev.get("status") is not None:
+                            score = oh_score_ev.get("score", 0)
+                            if score >= 6:
+                                st.error(f"🔥 점수 기반: 매우 높음 ({score})")
+                            elif score >= 4:
+                                st.warning(f"⚠️ 점수 기반: 예고 가능 ({score})")
+                            else:
+                                st.info(f"ℹ️ 점수 기반: 낮음 ({score})")
+                        # 👆 점수 기반 표시 끝
+
                     if oh_ev.get("criteria"):
                         st.dataframe(fmt_overheat_table(oh_ev),
                                      use_container_width=True, hide_index=True)
