@@ -283,6 +283,50 @@ def detect_anomaly(df):
 
 
 def evaluate_warning(df, idx):
+ def evaluate_warning_score(df, idx):
+    ...
+  def evaluate_warning_score(df, idx):
+    if idx < 20:
+        return {"status": None, "reason": "데이터 부족"}
+
+    curr = df["종가"].iloc[idx]
+    p5 = df["종가"].iloc[idx - 5]
+    p20 = df["종가"].iloc[idx - 20]
+
+    change_5d = curr / p5 if p5 else 0
+    change_20d = curr / p20 if p20 else 0
+
+    avg5_vol = df["거래량"].iloc[idx-4:idx+1].mean()
+    avg20_vol = df["거래량"].iloc[idx-19:idx+1].mean()
+    vol_ratio = avg5_vol / avg20_vol if avg20_vol > 0 else 0
+
+    prev_close = df["종가"].shift(1)
+    vola = (df["고가"] - df["저가"]) / prev_close
+    avg5_vola = vola.iloc[idx-4:idx+1].mean()
+    avg20_vola = vola.iloc[idx-19:idx+1].mean()
+    vola_ratio = avg5_vola / avg20_vola if avg20_vola > 0 else 0
+
+    score = 0
+
+    if change_5d > 1.4:
+        score += 2
+    elif change_5d > 1.25:
+        score += 1
+
+    if change_20d > 1.8:
+        score += 2
+    elif change_20d > 1.5:
+        score += 1
+
+    if vol_ratio > 5:
+        score += 2
+    elif vol_ratio > 3:
+        score += 1
+
+    if vola_ratio > 1.5:
+        score += 1
+
+    return {"score": score, "status": score >= 6}
     curr = int(df["종가"].iloc[idx])
     if idx < 20:
         return {"status": None, "reason": "데이터 부족"}
@@ -461,8 +505,8 @@ with tab1:
                 if isinstance(base_idx, slice):
                     base_idx = base_idx.stop - 1
 
-                warn_ev = evaluate_warning(df, base_idx)
-                oh_ev = evaluate_overheat(df, base_idx)
+                warn_ev = evaluate_warning_score(df, base_idx)
+                oh_ev = evaluate_overheat_score(df, base_idx)
                 curr_p = int(df["종가"].iloc[base_idx])
 
                 st.markdown(f"### 📍 {name} ({ticker})")
@@ -484,6 +528,16 @@ with tab1:
                             st.warning(f"{label} — 근접 중")
                         else:
                             st.success(label)
+                         # 👇 추가 시작
+score = warn_ev_new["score"]
+
+if score >= 6:
+    st.error(f"🔥 점수 기반: 매우 높음 ({score})")
+elif score >= 4:
+    st.warning(f"⚠️ 점수 기반: 예고 가능 ({score})")
+else:
+    st.info(f"ℹ️ 점수 기반: 낮음 ({score})")
+# 👆 추가 끝
                     if warn_ev.get("criteria"):
                         st.dataframe(fmt_warning_table(warn_ev),
                                      use_container_width=True, hide_index=True)
