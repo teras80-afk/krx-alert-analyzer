@@ -299,9 +299,9 @@ def evaluate_warning(df, idx):
         "status": all([c1, c2, c3]), "current": curr,
         "thresholds": {"5일x1.6": th1, "20일x2.0": th2, "15일최고": th3},
         "criteria": [
-            ("① 5일 전 × 1.6", f"{th1:,}원", f"{curr:,}원", c1, ratios[0]),
-            ("② 20일 전 × 2.0", f"{th2:,}원", f"{curr:,}원", c2, ratios[1]),
-            ("③ 15일 최고가", f"{th3:,}원", f"{curr:,}원", c3, ratios[2]),
+            ("① 5일 전 × 1.6", th1, c1, ratios[0]),
+            ("② 20일 전 × 2.0", th2, c2, ratios[1]),
+            ("③ 15일 최고가", th3, c3, ratios[2]),
         ],
         "max_ratio": max(ratios),
     }
