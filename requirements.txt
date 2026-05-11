@@ -1,6 +1,7 @@
-streamlit
-finance-datareader
+streamlit>=1.30
 pandas
 requests
+altair
 lxml
 OpenDartReader>=0.2.1
+openpyxl>=3.1.0
