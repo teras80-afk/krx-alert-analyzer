@@ -4,6 +4,7 @@
  [1] 개별 종목 조회 (차트 포함)
  [2] 관심종목 대시보드 (GitHub 저장 + 근접 경고)
  [3] 현재 지정종목 (네이버 금융 실시간 반영, 지정해제 시 자동 제외)
+ [4] 진단 (역추적)
 """
 import streamlit as st
 import pandas as pd
@@ -23,11 +24,14 @@ PROXIMITY_PCT = 0.95
 # ─────────────────────────────────────────────────────────────
 # 데이터 로더
 # ─────────────────────────────────────────────────────────────
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=1800)
 def get_ticker_name_map() -> dict:
+    """KRX KIND에서 종목 리스트 로딩. 실패 시 FinanceDataReader로 fallback."""
     import requests as _req
     from io import StringIO as _SIO
     result = {}
+
+    # 1차: KRX KIND
     for market_code in ["0", "1"]:  # 0=KOSPI, 1=KOSDAQ
         try:
             url = (f"https://kind.krx.co.kr/corpgeneral/corpList.do"
@@ -45,20 +49,62 @@ def get_ticker_name_map() -> dict:
                     result[code] = name
         except Exception:
             continue
+
     if result:
         return result
-    raise RuntimeError("종목 리스트 로딩 실패")
+
+    # 2차 fallback: FinanceDataReader
+    try:
+        df = fdr.StockListing('KRX')
+        # 컬럼명이 버전에 따라 다를 수 있음 (Code/Symbol, Name)
+        code_key = 'Code' if 'Code' in df.columns else (
+            'Symbol' if 'Symbol' in df.columns else None)
+        name_key = 'Name' if 'Name' in df.columns else None
+        if code_key and name_key:
+            for _, row in df.iterrows():
+                code = str(row[code_key]).zfill(6)
+                name = str(row[name_key])
+                if code and name and name != 'nan':
+                    result[code] = name
+            if result:
+                return result
+    except Exception:
+        pass
+
+    raise RuntimeError("종목 리스트 로딩 실패 (KRX, FinanceDataReader 모두 실패)")
 
 
 def resolve_ticker(user_input: str, name_map: dict) -> str | None:
+    """입력에서 종목코드 추출. 다중 후보 시 None 반환 (호출부에서 처리)."""
     s = user_input.strip()
+    if not s:
+        return None
+    # 6자리 숫자 → 코드 직접 매칭
     if s.isdigit() and len(s) == 6:
         return s if s in name_map else None
+    # 정확 일치 우선
     for t, n in name_map.items():
         if n == s:
             return t
+    # 시작 일치 (예: "삼성" → 삼성전자, 삼성전기 등 여러 개)
+    starts = [t for t, n in name_map.items() if n.startswith(s)]
+    if len(starts) == 1:
+        return starts[0]
+    # 부분 일치 (단일 후보일 때만)
     hits = [t for t, n in name_map.items() if s in n]
     return hits[0] if len(hits) == 1 else None
+
+
+def resolve_ticker_candidates(user_input: str, name_map: dict, limit: int = 10) -> list:
+    """다중 후보 반환 (UI에서 선택지 제공용)"""
+    s = user_input.strip()
+    if not s or (s.isdigit() and len(s) == 6):
+        return []
+    starts = [(t, n) for t, n in name_map.items() if n.startswith(s)]
+    if starts:
+        return starts[:limit]
+    hits = [(t, n) for t, n in name_map.items() if s in n]
+    return hits[:limit]
 
 
 @st.cache_data(ttl=600)
@@ -100,7 +146,9 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     dt = None
     s = str(designated_date_str).strip()
     current_year = datetime.now().year
+    now = pd.Timestamp.now()
 
+    # 연도 포함 포맷 먼저
     for fmt in ["%Y.%m.%d", "%Y-%m-%d", "%Y/%m/%d", "%Y%m%d"]:
         try:
             dt = pd.to_datetime(s, format=fmt)
@@ -108,12 +156,18 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
         except Exception:
             continue
 
-    # 년도 없는 MM.DD 같은 경우 — 현재 연도 가정
+    # 연도 없는 MM.DD 같은 경우 — 현재 연도로 가정 후 보정
     if dt is None:
         for fmt in ["%m.%d", "%m-%d", "%m/%d"]:
             try:
-                dt = pd.to_datetime(f"{current_year}.{s.replace('-', '.').replace('/', '.')}",
+                normalized = s.replace('-', '.').replace('/', '.')
+                dt = pd.to_datetime(f"{current_year}.{normalized}",
                                     format="%Y.%m.%d")
+                # 미래 날짜로 추정되면 작년으로 (연말연시 케이스)
+                if dt > now + pd.Timedelta(days=7):
+                    dt = dt - pd.DateOffset(years=1)
+                # 너무 오래된 과거(6개월 이상 전)면 올해 그대로 유지
+                # (지정종목은 보통 최근 1개월 내 지정이므로 이 케이스는 드묾)
                 break
             except Exception:
                 continue
@@ -121,7 +175,7 @@ def calculate_release_date(category: str, designated_date_str: str) -> str:
     if dt is None:
         return "—"
 
-    # 거래일 기준 계산 (주말 제외, 공휴일 미반영이라 ±1일 오차 가능)
+    # 거래일 기준 계산 (주말 제외, 공휴일 미반영이라 ±1~2일 오차 가능)
     days = 3 if category == "단기과열" else 10
     release_dt = dt + pd.offsets.BDay(days)
 
@@ -243,13 +297,37 @@ def parse_watchlist(text):
             if ln.strip() and not ln.startswith("#")]
 
 
-def add_to_watchlist(stock_names: list) -> str:
-    """관심종목 리스트에 종목 추가 (중복 제외)"""
+def add_to_watchlist(stock_names: list, name_map: dict) -> str:
+    """관심종목 리스트에 종목 추가 (코드 기준 중복 제외).
+    종목명을 받아도 코드로 정규화한 뒤 중복 검사를 수행해서,
+    '삼성전자' / '005930'이 같은 종목으로 인식되도록 함.
+    """
     current_text = st.session_state.get("watchlist_text", "")
-    current_set = set(parse_watchlist(current_text))
-    to_add = [n for n in stock_names if n and n not in current_set]
+    current_lines = parse_watchlist(current_text)
+
+    # 기존 watchlist를 코드 셋으로 정규화
+    current_codes = set()
+    for line in current_lines:
+        t = resolve_ticker(line, name_map)
+        if t:
+            current_codes.add(t)
+        else:
+            # 매칭 안 되는 항목도 원문 그대로 중복 체크용으로 보관
+            current_codes.add(line)
+
+    to_add = []
+    for n in stock_names:
+        if not n:
+            continue
+        t = resolve_ticker(n, name_map)
+        key = t if t else n
+        if key not in current_codes:
+            to_add.append(n)
+            current_codes.add(key)
+
     if not to_add:
         return "이미 모두 관심종목에 있습니다"
+
     new_lines = current_text.rstrip() + "\n" + "\n".join(to_add)
     ok, msg = github_put_watchlist(new_lines,
                                     st.session_state.get("watchlist_sha"))
@@ -494,11 +572,16 @@ try:
     name_map = get_ticker_name_map()
 except Exception as e:
     st.error(f"종목 리스트 로딩 실패: {e}")
+    st.caption("⚠️ KRX 서버 또는 FinanceDataReader 모두 응답이 없습니다. "
+               "잠시 후 새로고침해보세요.")
+    if st.button("🔄 다시 시도"):
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
 
 
 # ═══════════════════════════════════════════════════════════
-# 탭 3개
+# 탭 4개
 # ═══════════════════════════════════════════════════════════
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 개별 종목 조회",
@@ -514,13 +597,26 @@ with tab1:
     col_input, col_date_space = st.columns([2, 1])
     with col_input:
         user_input = st.text_input("종목코드 6자리 또는 종목명",
-                                   value="009150", key="single_input")
+                                   value="005930", key="single_input",
+                                   placeholder="예: 005930 또는 삼성전자")
 
     if user_input:
         ticker = resolve_ticker(user_input, name_map)
+
+        # 다중 후보 처리
         if not ticker:
-            st.error("종목을 찾지 못했습니다.")
-        else:
+            candidates = resolve_ticker_candidates(user_input, name_map)
+            if candidates:
+                st.warning(f"🔎 '{user_input}'와 일치하는 종목이 여러 개입니다. 하나를 선택하세요.")
+                options = [f"{n} ({t})" for t, n in candidates]
+                selected = st.selectbox("후보 선택", options, key="single_candidates")
+                if selected:
+                    # "삼성전자 (005930)" → "005930" 추출
+                    ticker = selected.split("(")[-1].rstrip(")")
+            else:
+                st.error("종목을 찾지 못했습니다.")
+
+        if ticker:
             name = name_map[ticker]
             end = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=200)).strftime("%Y-%m-%d")
@@ -573,7 +669,7 @@ with tab1:
                         else:
                             st.success(label)
 
-                        # 👇 점수 기반 표시 시작
+                        # 점수 기반 표시
                         if warn_score_ev.get("status") is not None:
                             score = warn_score_ev.get("score", 0)
                             if score >= 6:
@@ -582,7 +678,6 @@ with tab1:
                                 st.warning(f"⚠️ 점수 기반: 예고 가능 ({score})")
                             else:
                                 st.info(f"ℹ️ 점수 기반: 낮음 ({score})")
-                        # 👆 점수 기반 표시 끝
 
                     if warn_ev.get("criteria"):
                         st.dataframe(fmt_warning_table(warn_ev),
@@ -601,7 +696,7 @@ with tab1:
                         else:
                             st.success(label)
 
-                        # 👇 점수 기반 표시 시작
+                        # 점수 기반 표시
                         if oh_score_ev.get("status") is not None:
                             score = oh_score_ev.get("score", 0)
                             if score >= 6:
@@ -610,7 +705,6 @@ with tab1:
                                 st.warning(f"⚠️ 점수 기반: 예고 가능 ({score})")
                             else:
                                 st.info(f"ℹ️ 점수 기반: 낮음 ({score})")
-                        # 👆 점수 기반 표시 끝
 
                     if oh_ev.get("criteria"):
                         st.dataframe(fmt_overheat_table(oh_ev),
@@ -823,7 +917,7 @@ with tab3:
                     if st.button(f"➕ {category} 전체 추가",
                                  key=f"add_all_{category}"):
                         names = df[name_col].dropna().astype(str).tolist()
-                        result = add_to_watchlist(names)
+                        result = add_to_watchlist(names, name_map)
                         st.success(result) if "✅" in result else st.info(result)
 
     render_designated("투자경고", sub1)
@@ -856,9 +950,20 @@ with tab4:
 
     if diag_input:
         d_ticker = resolve_ticker(diag_input, name_map)
+
+        # 다중 후보 처리
         if not d_ticker:
-            st.error("종목을 찾지 못했습니다.")
-        else:
+            candidates = resolve_ticker_candidates(diag_input, name_map)
+            if candidates:
+                st.warning(f"🔎 '{diag_input}'와 일치하는 종목이 여러 개입니다. 하나를 선택하세요.")
+                options = [f"{n} ({t})" for t, n in candidates]
+                selected = st.selectbox("후보 선택", options, key="diag_candidates")
+                if selected:
+                    d_ticker = selected.split("(")[-1].rstrip(")")
+            else:
+                st.error("종목을 찾지 못했습니다.")
+
+        if d_ticker:
             d_name = name_map[d_ticker]
 
             d_end = (datetime.combine(diag_trigger_date, datetime.min.time())
